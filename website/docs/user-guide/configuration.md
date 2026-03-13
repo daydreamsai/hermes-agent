@@ -63,6 +63,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 |----------|-------|
 | **Nous Portal** | `hermes model` (OAuth, subscription-based) |
 | **OpenAI Codex** | `hermes model` (ChatGPT OAuth, uses Codex models) |
+| **Anthropic** | `hermes model` (API key, setup-token, or Claude Code auto-detect) |
 | **OpenRouter** | `OPENROUTER_API_KEY` in `~/.hermes/.env` |
 | **z.ai / GLM** | `GLM_API_KEY` in `~/.hermes/.env` (provider: `zai`) |
 | **Kimi / Moonshot** | `KIMI_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding`) |
@@ -76,6 +77,34 @@ The OpenAI Codex provider authenticates via device code (open a URL, enter a cod
 
 :::warning
 Even when using Nous Portal, Codex, or a custom endpoint, some tools (vision, web summarization, MoA) use a separate "auxiliary" model — by default Gemini Flash via OpenRouter. An `OPENROUTER_API_KEY` enables these tools automatically. You can also configure which model and provider these tools use — see [Auxiliary Models](#auxiliary-models) below.
+:::
+
+### Anthropic (Native)
+
+Use Claude models directly through the Anthropic API — no OpenRouter proxy needed. Supports three auth methods:
+
+```bash
+# With an API key (pay-per-token)
+export ANTHROPIC_API_KEY=sk-ant-api03-...
+hermes chat --provider anthropic --model claude-sonnet-4-6
+
+# With a Claude Code setup-token (Pro/Max subscription)
+export ANTHROPIC_API_KEY=sk-ant-oat01-...  # from 'claude setup-token'
+hermes chat --provider anthropic
+
+# Auto-detect Claude Code credentials (if you have Claude Code installed)
+hermes chat --provider anthropic  # reads ~/.claude.json automatically
+```
+
+Or set it permanently:
+```yaml
+model:
+  provider: "anthropic"
+  default: "claude-sonnet-4-6"
+```
+
+:::tip Aliases
+`--provider claude` and `--provider claude-code` also work as shorthand for `--provider anthropic`.
 :::
 
 ### First-Class Chinese AI Providers
@@ -471,6 +500,24 @@ compression:
 
 The `summary_model` must support a context length at least as large as your main model's, since it receives the full middle section of the conversation for compression.
 
+## Iteration Budget Pressure
+
+When the agent is working on a complex task with many tool calls, it can burn through its iteration budget (default: 90 turns) without realizing it's running low. Budget pressure automatically warns the model as it approaches the limit:
+
+| Threshold | Level | What the model sees |
+|-----------|-------|---------------------|
+| **70%** | Caution | `[BUDGET: 63/90. 27 iterations left. Start consolidating.]` |
+| **90%** | Warning | `[BUDGET WARNING: 81/90. Only 9 left. Respond NOW.]` |
+
+Warnings are injected into the last tool result's JSON (as a `_budget_warning` field) rather than as separate messages — this preserves prompt caching and doesn't disrupt the conversation structure.
+
+```yaml
+agent:
+  max_turns: 90                # Max iterations per conversation turn (default: 90)
+```
+
+Budget pressure is enabled by default. The agent sees warnings naturally as part of tool results, encouraging it to consolidate its work and deliver a response before running out of iterations.
+
 ## Auxiliary Models
 
 Hermes uses lightweight "auxiliary" models for side tasks like image analysis, web page summarization, and browser screenshot analysis. By default, these use **Gemini Flash** via OpenRouter or Nous Portal — you don't need to configure anything.
@@ -590,6 +637,16 @@ agent:
 
 When unset (default), reasoning effort defaults to "medium" — a balanced level that works well for most tasks. Setting a value overrides it — higher reasoning effort gives better results on complex tasks at the cost of more tokens and latency.
 
+You can also change the reasoning effort at runtime with the `/reasoning` command:
+
+```
+/reasoning           # Show current effort level and display state
+/reasoning high      # Set reasoning effort to high
+/reasoning none      # Disable reasoning
+/reasoning show      # Show model thinking above each response
+/reasoning hide      # Hide model thinking
+```
+
 ## TTS Configuration
 
 ```yaml
@@ -614,6 +671,7 @@ display:
   compact: false         # Compact output mode (less whitespace)
   resume_display: full   # full (show previous messages on resume) | minimal (one-liner only)
   bell_on_complete: false  # Play terminal bell when agent finishes (great for long tasks)
+  show_reasoning: false    # Show model reasoning/thinking above each response (toggle with /reasoning show|hide)
 ```
 
 | Mode | What you see |
@@ -631,6 +689,33 @@ stt:
 ```
 
 Requires `VOICE_TOOLS_OPENAI_KEY` in `.env` for OpenAI STT.
+
+## Quick Commands
+
+Define custom commands that run shell commands without invoking the LLM — zero token usage, instant execution. Especially useful from messaging platforms (Telegram, Discord, etc.) for quick server checks or utility scripts.
+
+```yaml
+quick_commands:
+  status:
+    type: exec
+    command: systemctl status hermes-agent
+  disk:
+    type: exec
+    command: df -h /
+  update:
+    type: exec
+    command: cd ~/.hermes/hermes-agent && git pull && pip install -e .
+  gpu:
+    type: exec
+    command: nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader
+```
+
+Usage: type `/status`, `/disk`, `/update`, or `/gpu` in the CLI or any messaging platform. The command runs locally on the host and returns the output directly — no LLM call, no tokens consumed.
+
+- **30-second timeout** — long-running commands are killed with an error message
+- **Priority** — quick commands are checked before skill commands, so you can override skill names
+- **Type** — only `exec` is supported (runs a shell command); other types show an error
+- **Works everywhere** — CLI, Telegram, Discord, Slack, WhatsApp, Signal
 
 ## Human Delay
 
@@ -684,7 +769,15 @@ delegation:
     - terminal
     - file
     - web
+  # model: "google/gemini-3-flash-preview"  # Override model (empty = inherit parent)
+  # provider: "openrouter"                  # Override provider (empty = inherit parent)
 ```
+
+**Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
+
+The delegation provider uses the same credential resolution as CLI/gateway startup. All configured providers are supported: `openrouter`, `nous`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`. When a provider is set, the system automatically resolves the correct base URL, API key, and API mode — no manual credential wiring needed.
+
+**Precedence:** `delegation.provider` in config → parent provider (inherited). `delegation.model` in config → parent model (inherited). Setting just `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter).
 
 ## Clarify
 

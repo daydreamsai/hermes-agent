@@ -17,6 +17,7 @@ import platform
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -47,13 +48,32 @@ def get_project_root() -> Path:
     """Get the project installation directory."""
     return Path(__file__).parent.parent.resolve()
 
+def _secure_dir(path):
+    """Set directory to owner-only access (0700). No-op on Windows."""
+    try:
+        os.chmod(path, 0o700)
+    except (OSError, NotImplementedError):
+        pass
+
+
+def _secure_file(path):
+    """Set file to owner-only read/write (0600). No-op on Windows."""
+    try:
+        if os.path.exists(str(path)):
+            os.chmod(path, 0o600)
+    except (OSError, NotImplementedError):
+        pass
+
+
 def ensure_hermes_home():
-    """Ensure ~/.hermes directory structure exists."""
+    """Ensure ~/.hermes directory structure exists with secure permissions."""
     home = get_hermes_home()
-    (home / "cron").mkdir(parents=True, exist_ok=True)
-    (home / "sessions").mkdir(parents=True, exist_ok=True)
-    (home / "logs").mkdir(parents=True, exist_ok=True)
-    (home / "memories").mkdir(parents=True, exist_ok=True)
+    home.mkdir(parents=True, exist_ok=True)
+    _secure_dir(home)
+    for subdir in ("cron", "sessions", "logs", "memories"):
+        d = home / subdir
+        d.mkdir(parents=True, exist_ok=True)
+        _secure_dir(d)
 
 
 # =============================================================================
@@ -101,19 +121,43 @@ DEFAULT_CONFIG = {
     
     "compression": {
         "enabled": True,
-        "threshold": 0.85,
+        "threshold": 0.50,
         "summary_model": "google/gemini-3-flash-preview",
         "summary_provider": "auto",
     },
     
-    # Auxiliary model overrides (advanced).  By default Hermes auto-selects
-    # the provider and model for each side task.  Set these to override.
+    # Auxiliary model config — provider:model for each side task.
+    # Format: provider is the provider name, model is the model slug.
+    # "auto" for provider = auto-detect best available provider.
+    # Empty model = use provider's default auxiliary model.
+    # All tasks fall back to openrouter:google/gemini-3-flash-preview if
+    # the configured provider is unavailable.
     "auxiliary": {
         "vision": {
-            "provider": "auto",    # auto | openrouter | nous | main
+            "provider": "auto",    # auto | openrouter | nous | codex | custom
             "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"
         },
         "web_extract": {
+            "provider": "auto",
+            "model": "",
+        },
+        "compression": {
+            "provider": "auto",
+            "model": "",
+        },
+        "session_search": {
+            "provider": "auto",
+            "model": "",
+        },
+        "skills_hub": {
+            "provider": "auto",
+            "model": "",
+        },
+        "mcp": {
+            "provider": "auto",
+            "model": "",
+        },
+        "flush_memories": {
             "provider": "auto",
             "model": "",
         },
@@ -124,6 +168,7 @@ DEFAULT_CONFIG = {
         "personality": "kawaii",
         "resume_display": "full",
         "bell_on_complete": False,
+        "show_reasoning": False,
         "skin": "default",
     },
     
@@ -163,7 +208,16 @@ DEFAULT_CONFIG = {
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
     },
-    
+
+    # Subagent delegation — override the provider:model used by delegate_task
+    # so child agents can run on a different (cheaper/faster) provider and model.
+    # Uses the same runtime provider resolution as CLI/gateway startup, so all
+    # configured providers (OpenRouter, Nous, Z.ai, Kimi, etc.) are supported.
+    "delegation": {
+        "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
+        "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
+    },
+
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
     # injected at the start of every API call for few-shot priming.
     # Never saved to sessions, logs, or trajectories.
@@ -178,11 +232,23 @@ DEFAULT_CONFIG = {
     # Empty string means use server-local time.
     "timezone": "",
 
+    # Discord platform settings (gateway mode)
+    "discord": {
+        "require_mention": True,       # Require @mention to respond in server channels
+        "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
+    },
+
     # Permanently allowed dangerous command patterns (added via "always" approval)
     "command_allowlist": [],
+    # User-defined quick commands that bypass the agent loop (type: exec only)
+    "quick_commands": {},
+    # Custom personalities — add your own entries here
+    # Supports string format: {"name": "system prompt"}
+    # Or dict format: {"name": {"description": "...", "system_prompt": "...", "tone": "...", "style": "..."}}
+    "personalities": {},
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 6,
+    "_config_version": 7,
 }
 
 # =============================================================================
@@ -207,14 +273,6 @@ REQUIRED_ENV_VARS = {}
 # Optional environment variables that enhance functionality
 OPTIONAL_ENV_VARS = {
     # ── Provider (handled in provider selection, not shown in checklists) ──
-    "NOUS_API_KEY": {
-        "description": "Nous Portal API key (direct API key access to Nous inference)",
-        "prompt": "Nous Portal API key",
-        "url": "https://portal.nousresearch.com",
-        "password": True,
-        "category": "provider",
-        "advanced": True,
-    },
     "NOUS_BASE_URL": {
         "description": "Nous Portal base URL override",
         "prompt": "Nous Portal base URL (leave empty for default)",
@@ -872,6 +930,7 @@ def save_config(config: Dict[str, Any]):
         normalized,
         extra_content=_COMMENTED_SECTIONS if sections else None,
     )
+    _secure_file(config_path)
 
 
 def load_env() -> Dict[str, str]:
@@ -922,8 +981,20 @@ def save_env_value(key: str, value: str):
             lines[-1] += "\n"
         lines.append(f"{key}={value}\n")
     
-    with open(env_path, 'w', **write_kw) as f:
-        f.writelines(lines)
+    fd, tmp_path = tempfile.mkstemp(dir=str(env_path.parent), suffix='.tmp', prefix='.env_')
+    try:
+        with os.fdopen(fd, 'w', **write_kw) as f:
+            f.writelines(lines)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, env_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    _secure_file(env_path)
 
     # Restrict .env permissions to owner-only (contains API keys)
     if not _IS_WINDOWS:
@@ -998,6 +1069,14 @@ def show_config():
     print(f"  Max turns:    {config.get('agent', {}).get('max_turns', DEFAULT_CONFIG['agent']['max_turns'])}")
     print(f"  Toolsets:     {', '.join(config.get('toolsets', ['all']))}")
     
+    # Display
+    print()
+    print(color("◆ Display", Colors.CYAN, Colors.BOLD))
+    display = config.get('display', {})
+    print(f"  Personality:  {display.get('personality', 'kawaii')}")
+    print(f"  Reasoning:    {'on' if display.get('show_reasoning', False) else 'off'}")
+    print(f"  Bell:         {'on' if display.get('bell_on_complete', False) else 'off'}")
+
     # Terminal
     print()
     print(color("◆ Terminal", Colors.CYAN, Colors.BOLD))
@@ -1040,7 +1119,7 @@ def show_config():
     enabled = compression.get('enabled', True)
     print(f"  Enabled:      {'yes' if enabled else 'no'}")
     if enabled:
-        print(f"  Threshold:    {compression.get('threshold', 0.85) * 100:.0f}%")
+        print(f"  Threshold:    {compression.get('threshold', 0.50) * 100:.0f}%")
         print(f"  Model:        {compression.get('summary_model', 'google/gemini-3-flash-preview')}")
         comp_provider = compression.get('summary_provider', 'auto')
         if comp_provider != 'auto':

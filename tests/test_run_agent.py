@@ -281,20 +281,21 @@ class TestMaskApiKey:
 
 class TestInit:
     def test_anthropic_base_url_accepted(self):
-        """Anthropic base URLs should be accepted (OpenAI-compatible endpoint)."""
+        """Anthropic base URLs should route to native Anthropic client."""
         with (
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI") as mock_openai,
+            patch("agent.anthropic_adapter._anthropic_sdk") as mock_anthropic,
         ):
-            AIAgent(
+            agent = AIAgent(
                 api_key="test-key-1234567890",
                 base_url="https://api.anthropic.com/v1/",
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
             )
-            mock_openai.assert_called_once()
+            assert agent.api_mode == "anthropic_messages"
+            mock_anthropic.Anthropic.assert_called_once()
 
     def test_prompt_caching_claude_openrouter(self):
         """Claude model via OpenRouter should enable prompt caching."""
@@ -344,6 +345,23 @@ class TestInit:
                 skip_memory=True,
             )
             assert a._use_prompt_caching is False
+
+    def test_prompt_caching_native_anthropic(self):
+        """Native Anthropic provider should enable prompt caching."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("agent.anthropic_adapter._anthropic_sdk"),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://api.anthropic.com/v1/",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert a.api_mode == "anthropic_messages"
+            assert a._use_prompt_caching is True
 
     def test_valid_tool_names_populated(self):
         """valid_tool_names should contain names from loaded tools."""
@@ -959,7 +977,7 @@ class TestFlushSentinelNotLeaked:
         agent.client.chat.completions.create.return_value = mock_response
 
         # Bypass auxiliary client so flush uses agent.client directly
-        with patch("agent.auxiliary_client.get_text_auxiliary_client", return_value=(None, None)):
+        with patch("agent.auxiliary_client.call_llm", side_effect=RuntimeError("no provider")):
             agent.flush_memories(messages, min_turns=0)
 
         # Check what was actually sent to the API
@@ -1208,3 +1226,158 @@ class TestSystemPromptStability:
         conversation_history = []
         should_prefetch = not conversation_history
         assert should_prefetch is True
+
+
+# ---------------------------------------------------------------------------
+# Iteration budget pressure warnings
+# ---------------------------------------------------------------------------
+
+class TestBudgetPressure:
+    """Budget pressure warning system (issue #414)."""
+
+    def test_no_warning_below_caution(self, agent):
+        agent.max_iterations = 60
+        assert agent._get_budget_warning(30) is None
+
+    def test_caution_at_70_percent(self, agent):
+        agent.max_iterations = 60
+        msg = agent._get_budget_warning(42)
+        assert msg is not None
+        assert "[BUDGET:" in msg
+        assert "18 iterations left" in msg
+
+    def test_warning_at_90_percent(self, agent):
+        agent.max_iterations = 60
+        msg = agent._get_budget_warning(54)
+        assert "[BUDGET WARNING:" in msg
+        assert "Provide your final response NOW" in msg
+
+    def test_last_iteration(self, agent):
+        agent.max_iterations = 60
+        msg = agent._get_budget_warning(59)
+        assert "1 iteration(s) left" in msg
+
+    def test_disabled(self, agent):
+        agent.max_iterations = 60
+        agent._budget_pressure_enabled = False
+        assert agent._get_budget_warning(55) is None
+
+    def test_zero_max_iterations(self, agent):
+        agent.max_iterations = 0
+        assert agent._get_budget_warning(0) is None
+
+    def test_injects_into_json_tool_result(self, agent):
+        """Warning should be injected as _budget_warning field in JSON tool results."""
+        import json
+        agent.max_iterations = 10
+        messages = [
+            {"role": "tool", "content": json.dumps({"output": "done", "exit_code": 0}), "tool_call_id": "tc1"}
+        ]
+        warning = agent._get_budget_warning(9)
+        assert warning is not None
+        # Simulate the injection logic
+        last_content = messages[-1]["content"]
+        parsed = json.loads(last_content)
+        parsed["_budget_warning"] = warning
+        messages[-1]["content"] = json.dumps(parsed, ensure_ascii=False)
+        result = json.loads(messages[-1]["content"])
+        assert "_budget_warning" in result
+        assert "BUDGET WARNING" in result["_budget_warning"]
+        assert result["output"] == "done"  # original content preserved
+
+    def test_appends_to_non_json_tool_result(self, agent):
+        """Warning should be appended as text for non-JSON tool results."""
+        agent.max_iterations = 10
+        messages = [
+            {"role": "tool", "content": "plain text result", "tool_call_id": "tc1"}
+        ]
+        warning = agent._get_budget_warning(9)
+        # Simulate injection logic for non-JSON
+        last_content = messages[-1]["content"]
+        try:
+            import json
+            json.loads(last_content)
+        except (json.JSONDecodeError, TypeError):
+            messages[-1]["content"] = last_content + f"\n\n{warning}"
+        assert "plain text result" in messages[-1]["content"]
+        assert "BUDGET WARNING" in messages[-1]["content"]
+
+
+class TestSafeWriter:
+    """Verify _SafeWriter guards stdout against OSError (broken pipes)."""
+
+    def test_write_delegates_normally(self):
+        """When stdout is healthy, _SafeWriter is transparent."""
+        from run_agent import _SafeWriter
+        from io import StringIO
+        inner = StringIO()
+        writer = _SafeWriter(inner)
+        writer.write("hello")
+        assert inner.getvalue() == "hello"
+
+    def test_write_catches_oserror(self):
+        """OSError on write is silently caught, returns len(data)."""
+        from run_agent import _SafeWriter
+        from unittest.mock import MagicMock
+        inner = MagicMock()
+        inner.write.side_effect = OSError(5, "Input/output error")
+        writer = _SafeWriter(inner)
+        result = writer.write("hello")
+        assert result == 5  # len("hello")
+
+    def test_flush_catches_oserror(self):
+        """OSError on flush is silently caught."""
+        from run_agent import _SafeWriter
+        from unittest.mock import MagicMock
+        inner = MagicMock()
+        inner.flush.side_effect = OSError(5, "Input/output error")
+        writer = _SafeWriter(inner)
+        writer.flush()  # should not raise
+
+    def test_print_survives_broken_stdout(self, monkeypatch):
+        """print() through _SafeWriter doesn't crash on broken pipe."""
+        import sys
+        from run_agent import _SafeWriter
+        from unittest.mock import MagicMock
+        broken = MagicMock()
+        broken.write.side_effect = OSError(5, "Input/output error")
+        original = sys.stdout
+        sys.stdout = _SafeWriter(broken)
+        try:
+            print("this should not crash")  # would raise without _SafeWriter
+        finally:
+            sys.stdout = original
+
+    def test_installed_in_run_conversation(self, agent):
+        """run_conversation installs _SafeWriter on sys.stdout."""
+        import sys
+        from run_agent import _SafeWriter
+        resp = _mock_response(content="Done", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        original = sys.stdout
+        try:
+            with (
+                patch.object(agent, "_persist_session"),
+                patch.object(agent, "_save_trajectory"),
+                patch.object(agent, "_cleanup_task_resources"),
+            ):
+                agent.run_conversation("test")
+            assert isinstance(sys.stdout, _SafeWriter)
+        finally:
+            sys.stdout = original
+
+    def test_double_wrap_prevented(self):
+        """Wrapping an already-wrapped stream doesn't add layers."""
+        import sys
+        from run_agent import _SafeWriter
+        from io import StringIO
+        inner = StringIO()
+        wrapped = _SafeWriter(inner)
+        # isinstance check should prevent double-wrapping
+        assert isinstance(wrapped, _SafeWriter)
+        # The guard in run_conversation checks isinstance before wrapping
+        if not isinstance(wrapped, _SafeWriter):
+            wrapped = _SafeWriter(wrapped)
+        # Still just one layer
+        wrapped.write("test")
+        assert inner.getvalue() == "test"

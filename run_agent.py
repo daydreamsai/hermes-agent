@@ -99,6 +99,51 @@ from agent.trajectory import (
 )
 
 
+class _SafeWriter:
+    """Transparent stdout wrapper that catches OSError from broken pipes.
+
+    When hermes-agent runs as a systemd service, Docker container, or headless
+    daemon, the stdout pipe can become unavailable (idle timeout, buffer
+    exhaustion, socket reset). Any print() call then raises
+    ``OSError: [Errno 5] Input/output error``, which can crash
+    run_conversation() — especially via double-fault when the except handler
+    also tries to print.
+
+    This wrapper delegates all writes to the underlying stream and silently
+    catches OSError.  It is installed once at the start of run_conversation()
+    and is transparent when stdout is healthy (zero overhead on the happy path).
+    """
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, inner):
+        object.__setattr__(self, "_inner", inner)
+
+    def write(self, data):
+        try:
+            return self._inner.write(data)
+        except OSError:
+            return len(data) if isinstance(data, str) else 0
+
+    def flush(self):
+        try:
+            self._inner.flush()
+        except OSError:
+            pass
+
+    def fileno(self):
+        return self._inner.fileno()
+
+    def isatty(self):
+        try:
+            return self._inner.isatty()
+        except OSError:
+            return False
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 class IterationBudget:
     """Thread-safe shared iteration counter for parent and child agents.
 
@@ -173,6 +218,7 @@ class AIAgent:
         session_id: str = None,
         tool_progress_callback: callable = None,
         thinking_callback: callable = None,
+        reasoning_callback: callable = None,
         clarify_callback: callable = None,
         step_callback: callable = None,
         max_tokens: int = None,
@@ -187,6 +233,7 @@ class AIAgent:
         fallback_model: Dict[str, Any] = None,
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
+        pass_session_id: bool = False,
     ):
         """
         Initialize the AI Agent.
@@ -241,6 +288,7 @@ class AIAgent:
         self.ephemeral_system_prompt = ephemeral_system_prompt
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self.skip_context_files = skip_context_files
+        self.pass_session_id = pass_session_id
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
         # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
@@ -248,18 +296,22 @@ class AIAgent:
         self.base_url = base_url or OPENROUTER_BASE_URL
         provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
         self.provider = provider_name or "openrouter"
-        if api_mode in {"chat_completions", "codex_responses"}:
+        if api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
             self.api_mode = api_mode
         elif self.provider == "openai-codex":
             self.api_mode = "codex_responses"
         elif (provider_name is None) and "chatgpt.com/backend-api/codex" in self.base_url.lower():
             self.api_mode = "codex_responses"
             self.provider = "openai-codex"
+        elif self.provider == "anthropic" or (provider_name is None and "api.anthropic.com" in self.base_url.lower()):
+            self.api_mode = "anthropic_messages"
+            self.provider = "anthropic"
         else:
             self.api_mode = "chat_completions"
 
         self.tool_progress_callback = tool_progress_callback
         self.thinking_callback = thinking_callback
+        self.reasoning_callback = reasoning_callback
         self.clarify_callback = clarify_callback
         self.step_callback = step_callback
         self._last_reported_tool = None  # Track for "new tool" mode
@@ -294,9 +346,17 @@ class AIAgent:
         # conversation prefix. Uses system_and_3 strategy (4 breakpoints).
         is_openrouter = "openrouter" in self.base_url.lower()
         is_claude = "claude" in self.model.lower()
-        self._use_prompt_caching = is_openrouter and is_claude
+        is_native_anthropic = self.api_mode == "anthropic_messages"
+        self._use_prompt_caching = (is_openrouter and is_claude) or is_native_anthropic
         self._cache_ttl = "5m"  # Default 5-minute TTL (1.25x write cost)
         
+        # Iteration budget pressure: warn the LLM as it approaches max_iterations.
+        # Warnings are injected into the last tool result JSON (not as separate
+        # messages) so they don't break message structure or invalidate caching.
+        self._budget_caution_threshold = 0.7   # 70% — nudge to start wrapping up
+        self._budget_warning_threshold = 0.9   # 90% — urgent, respond now
+        self._budget_pressure_enabled = True
+
         # Persistent error log -- always writes WARNING+ to ~/.hermes/logs/errors.log
         # so tool failures, API errors, etc. are inspectable after the fact.
         from agent.redact import RedactingFormatter
@@ -364,52 +424,84 @@ class AIAgent:
                 ]:
                     logging.getLogger(quiet_logger).setLevel(logging.ERROR)
         
-        # Initialize OpenAI client - defaults to OpenRouter
-        client_kwargs = {}
-        
-        # Default to OpenRouter if no base_url provided
-        if base_url:
-            client_kwargs["base_url"] = base_url
-        else:
-            client_kwargs["base_url"] = OPENROUTER_BASE_URL
-        
-        # Handle API key - OpenRouter is the primary provider
-        if api_key:
-            client_kwargs["api_key"] = api_key
-        else:
-            # Primary: OPENROUTER_API_KEY, fallback to direct provider keys
-            client_kwargs["api_key"] = os.getenv("OPENROUTER_API_KEY", "")
-        
-        # OpenRouter app attribution — shows hermes-agent in rankings/analytics
-        effective_base = client_kwargs.get("base_url", "")
-        if "openrouter" in effective_base.lower():
-            client_kwargs["default_headers"] = {
-                "HTTP-Referer": "https://github.com/NousResearch/hermes-agent",
-                "X-OpenRouter-Title": "Hermes Agent",
-                "X-OpenRouter-Categories": "productivity,cli-agent",
-            }
-        elif "api.kimi.com" in effective_base.lower():
-            # Kimi Code API requires a recognized coding-agent User-Agent
-            # (see https://github.com/MoonshotAI/kimi-cli)
-            client_kwargs["default_headers"] = {
-                "User-Agent": "KimiCLI/1.0",
-            }
-        
-        self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
-        try:
-            self.client = OpenAI(**client_kwargs)
+        # Initialize LLM client via centralized provider router.
+        # The router handles auth resolution, base URL, headers, and
+        # Codex/Anthropic wrapping for all known providers.
+        # raw_codex=True because the main agent needs direct responses.stream()
+        # access for Codex Responses API streaming.
+        self._anthropic_client = None
+
+        if self.api_mode == "anthropic_messages":
+            from agent.anthropic_adapter import build_anthropic_client
+            effective_key = api_key or os.getenv("ANTHROPIC_API_KEY", "") or os.getenv("ANTHROPIC_TOKEN", "")
+            if not effective_key:
+                from agent.anthropic_adapter import resolve_anthropic_token
+                effective_key = resolve_anthropic_token() or ""
+            self._anthropic_api_key = effective_key
+            self._anthropic_client = build_anthropic_client(effective_key, base_url if base_url and "anthropic" in base_url else None)
+            # No OpenAI client needed for Anthropic mode
+            self.client = None
+            self._client_kwargs = {}
             if not self.quiet_mode:
-                print(f"🤖 AI Agent initialized with model: {self.model}")
-                if base_url:
-                    print(f"🔗 Using custom base URL: {base_url}")
-                # Always show API key info (masked) for debugging auth issues
-                key_used = client_kwargs.get("api_key", "none")
-                if key_used and key_used != "dummy-key" and len(key_used) > 12:
-                    print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
+                print(f"🤖 AI Agent initialized with model: {self.model} (Anthropic native)")
+                if effective_key and len(effective_key) > 12:
+                    print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
+        else:
+            if api_key and base_url:
+                # Explicit credentials from CLI/gateway — construct directly.
+                # The runtime provider resolver already handled auth for us.
+                client_kwargs = {"api_key": api_key, "base_url": base_url}
+                effective_base = base_url
+                if "openrouter" in effective_base.lower():
+                    client_kwargs["default_headers"] = {
+                        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+                        "X-OpenRouter-Title": "Hermes Agent",
+                        "X-OpenRouter-Categories": "productivity,cli-agent",
+                    }
+                elif "api.kimi.com" in effective_base.lower():
+                    client_kwargs["default_headers"] = {
+                        "User-Agent": "KimiCLI/1.3",
+                    }
+            else:
+                # No explicit creds — use the centralized provider router
+                from agent.auxiliary_client import resolve_provider_client
+                _routed_client, _ = resolve_provider_client(
+                    self.provider or "auto", model=self.model, raw_codex=True)
+                if _routed_client is not None:
+                    client_kwargs = {
+                        "api_key": _routed_client.api_key,
+                        "base_url": str(_routed_client.base_url),
+                    }
+                    # Preserve any default_headers the router set
+                    if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:
+                        client_kwargs["default_headers"] = dict(_routed_client._default_headers)
                 else:
-                    print(f"⚠️  Warning: API key appears invalid or missing (got: '{key_used[:20] if key_used else 'none'}...')")
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
+                    # Final fallback: try raw OpenRouter key
+                    client_kwargs = {
+                        "api_key": os.getenv("OPENROUTER_API_KEY", ""),
+                        "base_url": OPENROUTER_BASE_URL,
+                        "default_headers": {
+                            "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+                            "X-OpenRouter-Title": "Hermes Agent",
+                            "X-OpenRouter-Categories": "productivity,cli-agent",
+                        },
+                    }
+            
+            self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
+            try:
+                self.client = OpenAI(**client_kwargs)
+                if not self.quiet_mode:
+                    print(f"🤖 AI Agent initialized with model: {self.model}")
+                    if base_url:
+                        print(f"🔗 Using custom base URL: {base_url}")
+                    # Always show API key info (masked) for debugging auth issues
+                    key_used = client_kwargs.get("api_key", "none")
+                    if key_used and key_used != "dummy-key" and len(key_used) > 12:
+                        print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
+                    else:
+                        print(f"⚠️  Warning: API key appears invalid or missing (got: '{key_used[:20] if key_used else 'none'}...')")
+            except Exception as e:
+                raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
         
         # Provider fallback — a single backup model/provider tried when the
         # primary is exhausted (rate-limit, overload, connection failure).
@@ -463,7 +555,8 @@ class AIAgent:
         
         # Show prompt caching status
         if self._use_prompt_caching and not self.quiet_mode:
-            print(f"💾 Prompt caching: ENABLED (Claude via OpenRouter, {self._cache_ttl} TTL)")
+            source = "native Anthropic" if is_native_anthropic else "Claude via OpenRouter"
+            print(f"💾 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
         
         # Session logging setup - auto-save conversation trajectories for debugging
         self.session_start = datetime.now()
@@ -594,7 +687,7 @@ class AIAgent:
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
         # Configuration via config.yaml (compression section) or environment variables
-        compression_threshold = float(os.getenv("CONTEXT_COMPRESSION_THRESHOLD", "0.85"))
+        compression_threshold = float(os.getenv("CONTEXT_COMPRESSION_THRESHOLD", "0.50"))
         compression_enabled = os.getenv("CONTEXT_COMPRESSION_ENABLED", "true").lower() in ("true", "1", "yes")
         compression_summary_model = os.getenv("CONTEXT_COMPRESSION_MODEL") or None
         
@@ -1397,7 +1490,14 @@ class AIAgent:
                     prompt_parts.append(user_block)
 
         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
-        skills_prompt = build_skills_system_prompt() if has_skills_tools else ""
+        if has_skills_tools:
+            avail_toolsets = {ts for ts, avail in check_toolset_requirements().items() if avail}
+            skills_prompt = build_skills_system_prompt(
+                available_tools=self.valid_tool_names,
+                available_toolsets=avail_toolsets,
+            )
+        else:
+            skills_prompt = ""
         if skills_prompt:
             prompt_parts.append(skills_prompt)
 
@@ -1408,9 +1508,10 @@ class AIAgent:
 
         from hermes_time import now as _hermes_now
         now = _hermes_now()
-        prompt_parts.append(
-            f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
-        )
+        timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
+        if self.pass_session_id and self.session_id:
+            timestamp_line += f"\nSession ID: {self.session_id}"
+        prompt_parts.append(timestamp_line)
 
         platform_key = (self.platform or "").lower().strip()
         if platform_key in PLATFORM_HINTS:
@@ -1772,6 +1873,7 @@ class AIAgent:
         allowed_keys = {
             "model", "instructions", "input", "tools", "store",
             "reasoning", "include", "max_output_tokens", "temperature",
+            "tool_choice", "parallel_tool_calls", "prompt_cache_key",
         }
         normalized: Dict[str, Any] = {
             "model": model,
@@ -1796,6 +1898,12 @@ class AIAgent:
         temperature = api_kwargs.get("temperature")
         if isinstance(temperature, (int, float)):
             normalized["temperature"] = float(temperature)
+
+        # Pass through tool_choice, parallel_tool_calls, prompt_cache_key
+        for passthrough_key in ("tool_choice", "parallel_tool_calls", "prompt_cache_key"):
+            val = api_kwargs.get(passthrough_key)
+            if val is not None:
+                normalized[passthrough_key] = val
 
         if allow_stream:
             stream = api_kwargs.get("stream")
@@ -2148,6 +2256,8 @@ class AIAgent:
             try:
                 if self.api_mode == "codex_responses":
                     result["response"] = self._run_codex_stream(api_kwargs)
+                elif self.api_mode == "anthropic_messages":
+                    result["response"] = self._anthropic_client.messages.create(**api_kwargs)
                 else:
                     result["response"] = self.client.chat.completions.create(**api_kwargs)
             except Exception as e:
@@ -2160,12 +2270,19 @@ class AIAgent:
             if self._interrupt_requested:
                 # Force-close the HTTP connection to stop token generation
                 try:
-                    self.client.close()
+                    if self.api_mode == "anthropic_messages":
+                        self._anthropic_client.close()
+                    else:
+                        self.client.close()
                 except Exception:
                     pass
                 # Rebuild the client for future calls (cheap, no network)
                 try:
-                    self.client = OpenAI(**self._client_kwargs)
+                    if self.api_mode == "anthropic_messages":
+                        from agent.anthropic_adapter import build_anthropic_client
+                        self._anthropic_client = build_anthropic_client(self._anthropic_api_key)
+                    else:
+                        self.client = OpenAI(**self._client_kwargs)
                 except Exception:
                     pass
                 raise InterruptedError("Agent interrupted during API call")
@@ -2175,75 +2292,6 @@ class AIAgent:
 
     # ── Provider fallback ──────────────────────────────────────────────────
 
-    # API-key providers: provider → (base_url, [env_var_names])
-    _FALLBACK_API_KEY_PROVIDERS = {
-        "openrouter": (OPENROUTER_BASE_URL, ["OPENROUTER_API_KEY"]),
-        "zai": ("https://api.z.ai/api/paas/v4", ["ZAI_API_KEY", "Z_AI_API_KEY"]),
-        "kimi-coding": ("https://api.moonshot.ai/v1", ["KIMI_API_KEY"]),
-        "minimax": ("https://api.minimax.io/v1", ["MINIMAX_API_KEY"]),
-        "minimax-cn": ("https://api.minimaxi.com/v1", ["MINIMAX_CN_API_KEY"]),
-    }
-
-    # OAuth providers: provider → (resolver_import_path, api_mode)
-    # Each resolver returns {"api_key": ..., "base_url": ...}.
-    _FALLBACK_OAUTH_PROVIDERS = {
-        "openai-codex": ("resolve_codex_runtime_credentials", "codex_responses"),
-        "nous": ("resolve_nous_runtime_credentials", "chat_completions"),
-    }
-
-    def _resolve_fallback_credentials(
-        self, fb_provider: str, fb_config: dict
-    ) -> Optional[tuple]:
-        """Resolve credentials for a fallback provider.
-
-        Returns (api_key, base_url, api_mode) on success, or None on failure.
-        Handles three cases:
-          1. OAuth providers (openai-codex, nous) — call credential resolver
-          2. API-key providers (openrouter, zai, etc.) — read env var
-          3. Custom endpoints — use base_url + api_key_env from config
-        """
-        # ── 1. OAuth providers ────────────────────────────────────────
-        if fb_provider in self._FALLBACK_OAUTH_PROVIDERS:
-            resolver_name, api_mode = self._FALLBACK_OAUTH_PROVIDERS[fb_provider]
-            try:
-                import hermes_cli.auth as _auth
-                resolver = getattr(_auth, resolver_name)
-                creds = resolver()
-                return creds["api_key"], creds["base_url"], api_mode
-            except Exception as e:
-                logging.warning(
-                    "Fallback to %s failed (credential resolution): %s",
-                    fb_provider, e,
-                )
-                return None
-
-        # ── 2. API-key providers ──────────────────────────────────────
-        fb_key = (fb_config.get("api_key") or "").strip()
-        if not fb_key:
-            key_env = (fb_config.get("api_key_env") or "").strip()
-            if key_env:
-                fb_key = os.getenv(key_env, "")
-            elif fb_provider in self._FALLBACK_API_KEY_PROVIDERS:
-                for env_var in self._FALLBACK_API_KEY_PROVIDERS[fb_provider][1]:
-                    fb_key = os.getenv(env_var, "")
-                    if fb_key:
-                        break
-        if not fb_key:
-            logging.warning(
-                "Fallback model configured but no API key found for provider '%s'",
-                fb_provider,
-            )
-            return None
-
-        # ── 3. Resolve base URL ───────────────────────────────────────
-        fb_base_url = (fb_config.get("base_url") or "").strip()
-        if not fb_base_url and fb_provider in self._FALLBACK_API_KEY_PROVIDERS:
-            fb_base_url = self._FALLBACK_API_KEY_PROVIDERS[fb_provider][0]
-        if not fb_base_url:
-            fb_base_url = OPENROUTER_BASE_URL
-
-        return fb_key, fb_base_url, "chat_completions"
-
     def _try_activate_fallback(self) -> bool:
         """Switch to the configured fallback model/provider.
 
@@ -2251,6 +2299,10 @@ class AIAgent:
         OpenAI client, model slug, and provider in-place so the retry loop
         can continue with the new backend.  One-shot: returns False if
         already activated or not configured.
+
+        Uses the centralized provider router (resolve_provider_client) for
+        auth resolution and client construction — no duplicated provider→key
+        mappings.
         """
         if self._fallback_activated or not self._fallback_model:
             return False
@@ -2261,25 +2313,31 @@ class AIAgent:
         if not fb_provider or not fb_model:
             return False
 
-        resolved = self._resolve_fallback_credentials(fb_provider, fb)
-        if resolved is None:
-            return False
-        fb_key, fb_base_url, fb_api_mode = resolved
-
-        # Build new client
+        # Use centralized router for client construction.
+        # raw_codex=True because the main agent needs direct responses.stream()
+        # access for Codex providers.
         try:
-            client_kwargs = {"api_key": fb_key, "base_url": fb_base_url}
-            if "openrouter" in fb_base_url.lower():
-                client_kwargs["default_headers"] = {
-                    "HTTP-Referer": "https://github.com/NousResearch/hermes-agent",
-                    "X-OpenRouter-Title": "Hermes Agent",
-                    "X-OpenRouter-Categories": "productivity,cli-agent",
-                }
-            elif "api.kimi.com" in fb_base_url.lower():
-                client_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.0"}
+            from agent.auxiliary_client import resolve_provider_client
+            fb_client, _ = resolve_provider_client(
+                fb_provider, model=fb_model, raw_codex=True)
+            if fb_client is None:
+                logging.warning(
+                    "Fallback to %s failed: provider not configured",
+                    fb_provider)
+                return False
 
-            self.client = OpenAI(**client_kwargs)
-            self._client_kwargs = client_kwargs
+            # Determine api_mode from provider
+            fb_api_mode = "chat_completions"
+            if fb_provider == "openai-codex":
+                fb_api_mode = "codex_responses"
+            fb_base_url = str(fb_client.base_url)
+
+            # Swap client and config in-place
+            self.client = fb_client
+            self._client_kwargs = {
+                "api_key": fb_client.api_key,
+                "base_url": fb_base_url,
+            }
             old_model = self.model
             self.model = fb_model
             self.provider = fb_provider
@@ -2310,6 +2368,16 @@ class AIAgent:
 
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
+        if self.api_mode == "anthropic_messages":
+            from agent.anthropic_adapter import build_anthropic_kwargs
+            return build_anthropic_kwargs(
+                model=self.model,
+                messages=api_messages,
+                tools=self.tools,
+                max_tokens=None,
+                reasoning_config=self.reasoning_config,
+            )
+
         if self.api_mode == "codex_responses":
             instructions = ""
             payload_messages = api_messages
@@ -2333,7 +2401,10 @@ class AIAgent:
                 "instructions": instructions,
                 "input": self._chat_messages_to_responses_input(payload_messages),
                 "tools": self._responses_tools(),
+                "tool_choice": "auto",
+                "parallel_tool_calls": True,
                 "store": False,
+                "prompt_cache_key": self.session_id,
             }
 
             if reasoning_enabled:
@@ -2373,16 +2444,26 @@ class AIAgent:
 
         extra_body = {}
 
-        if provider_preferences:
-            extra_body["provider"] = provider_preferences
-
         _is_openrouter = "openrouter" in self.base_url.lower()
+
+        # Provider preferences (only, ignore, order, sort) are OpenRouter-
+        # specific.  Only send to OpenRouter-compatible endpoints.
+        # TODO: Nous Portal will add transparent proxy support — re-enable
+        # for _is_nous when their backend is updated.
+        if provider_preferences and _is_openrouter:
+            extra_body["provider"] = provider_preferences
         _is_nous = "nousresearch" in self.base_url.lower()
 
         _is_mistral = "api.mistral.ai" in self.base_url.lower()
         if (_is_openrouter or _is_nous) and not _is_mistral:
             if self.reasoning_config is not None:
-                extra_body["reasoning"] = self.reasoning_config
+                rc = dict(self.reasoning_config)
+                # Nous Portal requires reasoning enabled — don't send
+                # enabled=false to it (would cause 400).
+                if _is_nous and rc.get("enabled") is False:
+                    pass  # omit reasoning entirely for Nous when disabled
+                else:
+                    extra_body["reasoning"] = rc
             else:
                 extra_body["reasoning"] = {
                     "enabled": True,
@@ -2406,9 +2487,25 @@ class AIAgent:
         """
         reasoning_text = self._extract_reasoning(assistant_message)
 
+        # Fallback: extract inline <think> blocks from content when no structured
+        # reasoning fields are present (some models/providers embed thinking
+        # directly in the content rather than returning separate API fields).
+        if not reasoning_text:
+            content = assistant_message.content or ""
+            think_blocks = re.findall(r'<think>(.*?)</think>', content, flags=re.DOTALL)
+            if think_blocks:
+                combined = "\n\n".join(b.strip() for b in think_blocks if b.strip())
+                reasoning_text = combined or None
+
         if reasoning_text and self.verbose_logging:
             preview = reasoning_text[:100] + "..." if len(reasoning_text) > 100 else reasoning_text
             logging.debug(f"Captured reasoning ({len(reasoning_text)} chars): {preview}")
+
+        if reasoning_text and self.reasoning_callback:
+            try:
+                self.reasoning_callback(reasoning_text)
+            except Exception:
+                pass
 
         msg = {
             "role": "assistant",
@@ -2488,6 +2585,31 @@ class AIAgent:
 
         return msg
 
+    @staticmethod
+    def _sanitize_tool_calls_for_strict_api(api_msg: dict) -> dict:
+        """Strip Codex Responses API fields from tool_calls for strict providers.
+
+        Providers like Mistral strictly validate the Chat Completions schema
+        and reject unknown fields (call_id, response_item_id) with 422.
+        These fields are preserved in the internal message history — this
+        method only modifies the outgoing API copy.
+
+        Creates new tool_call dicts rather than mutating in-place, so the
+        original messages list retains call_id/response_item_id for Codex
+        Responses API compatibility (e.g. if the session falls back to a
+        Codex provider later).
+        """
+        tool_calls = api_msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            return api_msg
+        _STRIP_KEYS = {"call_id", "response_item_id"}
+        api_msg["tool_calls"] = [
+            {k: v for k, v in tc.items() if k not in _STRIP_KEYS}
+            if isinstance(tc, dict) else tc
+            for tc in tool_calls
+        ]
+        return api_msg
+
     def flush_memories(self, messages: list = None, min_turns: int = None):
         """Give the model one turn to persist memories before context is lost.
 
@@ -2525,6 +2647,7 @@ class AIAgent:
 
         try:
             # Build API messages for the flush call
+            _is_strict_api = "api.mistral.ai" in self.base_url.lower()
             api_messages = []
             for msg in messages:
                 api_msg = msg.copy()
@@ -2535,6 +2658,8 @@ class AIAgent:
                 api_msg.pop("reasoning", None)
                 api_msg.pop("finish_reason", None)
                 api_msg.pop("_flush_sentinel", None)
+                if _is_strict_api:
+                    self._sanitize_tool_calls_for_strict_api(api_msg)
                 api_messages.append(api_msg)
 
             if self._cached_system_prompt:
@@ -2553,19 +2678,22 @@ class AIAgent:
 
             # Use auxiliary client for the flush call when available --
             # it's cheaper and avoids Codex Responses API incompatibility.
-            from agent.auxiliary_client import get_text_auxiliary_client
-            aux_client, aux_model = get_text_auxiliary_client()
+            from agent.auxiliary_client import call_llm as _call_llm
+            _aux_available = True
+            try:
+                response = _call_llm(
+                    task="flush_memories",
+                    messages=api_messages,
+                    tools=[memory_tool_def],
+                    temperature=0.3,
+                    max_tokens=5120,
+                    timeout=30.0,
+                )
+            except RuntimeError:
+                _aux_available = False
+                response = None
 
-            if aux_client:
-                api_kwargs = {
-                    "model": aux_model,
-                    "messages": api_messages,
-                    "tools": [memory_tool_def],
-                    "temperature": 0.3,
-                    "max_tokens": 5120,
-                }
-                response = aux_client.chat.completions.create(**api_kwargs, timeout=30.0)
-            elif self.api_mode == "codex_responses":
+            if not _aux_available and self.api_mode == "codex_responses":
                 # No auxiliary client -- use the Codex Responses path directly
                 codex_kwargs = self._build_api_kwargs(api_messages)
                 codex_kwargs["tools"] = self._responses_tools([memory_tool_def])
@@ -2573,7 +2701,16 @@ class AIAgent:
                 if "max_output_tokens" in codex_kwargs:
                     codex_kwargs["max_output_tokens"] = 5120
                 response = self._run_codex_stream(codex_kwargs)
-            else:
+            elif not _aux_available and self.api_mode == "anthropic_messages":
+                # Native Anthropic — use the Anthropic client directly
+                from agent.anthropic_adapter import build_anthropic_kwargs as _build_ant_kwargs
+                ant_kwargs = _build_ant_kwargs(
+                    model=self.model, messages=api_messages,
+                    tools=[memory_tool_def], max_tokens=5120,
+                    reasoning_config=None,
+                )
+                response = self._anthropic_client.messages.create(**ant_kwargs)
+            elif not _aux_available:
                 api_kwargs = {
                     "model": self.model,
                     "messages": api_messages,
@@ -2583,12 +2720,17 @@ class AIAgent:
                 }
                 response = self.client.chat.completions.create(**api_kwargs, timeout=30.0)
 
-            # Extract tool calls from the response, handling both API formats
+            # Extract tool calls from the response, handling all API formats
             tool_calls = []
-            if self.api_mode == "codex_responses" and not aux_client:
+            if self.api_mode == "codex_responses" and not _aux_available:
                 assistant_msg, _ = self._normalize_codex_response(response)
                 if assistant_msg and assistant_msg.tool_calls:
                     tool_calls = assistant_msg.tool_calls
+            elif self.api_mode == "anthropic_messages" and not _aux_available:
+                from agent.anthropic_adapter import normalize_anthropic_response as _nar_flush
+                _flush_msg, _ = _nar_flush(response)
+                if _flush_msg and _flush_msg.tool_calls:
+                    tool_calls = _flush_msg.tool_calls
             elif hasattr(response, "choices") and response.choices:
                 assistant_message = response.choices[0].message
                 if assistant_message.tool_calls:
@@ -2691,7 +2833,7 @@ class AIAgent:
 
         return compressed, new_system_prompt
 
-    def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str) -> None:
+    def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages."""
         for i, tool_call in enumerate(assistant_message.tool_calls, 1):
             # SAFETY: check interrupt BEFORE starting each tool.
@@ -2938,6 +3080,51 @@ class AIAgent:
             if self.tool_delay > 0 and i < len(assistant_message.tool_calls):
                 time.sleep(self.tool_delay)
 
+        # ── Budget pressure injection ─────────────────────────────────
+        # After all tool calls in this turn are processed, check if we're
+        # approaching max_iterations. If so, inject a warning into the LAST
+        # tool result's JSON so the LLM sees it naturally when reading results.
+        budget_warning = self._get_budget_warning(api_call_count)
+        if budget_warning and messages and messages[-1].get("role") == "tool":
+            last_content = messages[-1]["content"]
+            try:
+                parsed = json.loads(last_content)
+                if isinstance(parsed, dict):
+                    parsed["_budget_warning"] = budget_warning
+                    messages[-1]["content"] = json.dumps(parsed, ensure_ascii=False)
+                else:
+                    messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+            except (json.JSONDecodeError, TypeError):
+                messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
+            if not self.quiet_mode:
+                remaining = self.max_iterations - api_call_count
+                tier = "⚠️  WARNING" if remaining <= self.max_iterations * 0.1 else "💡 CAUTION"
+                print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
+
+    def _get_budget_warning(self, api_call_count: int) -> Optional[str]:
+        """Return a budget pressure string, or None if not yet needed.
+
+        Two-tier system:
+          - Caution (70%): nudge to consolidate work
+          - Warning (90%): urgent, must respond now
+        """
+        if not self._budget_pressure_enabled or self.max_iterations <= 0:
+            return None
+        progress = api_call_count / self.max_iterations
+        remaining = self.max_iterations - api_call_count
+        if progress >= self._budget_warning_threshold:
+            return (
+                f"[BUDGET WARNING: Iteration {api_call_count}/{self.max_iterations}. "
+                f"Only {remaining} iteration(s) left. "
+                "Provide your final response NOW. No more tool calls unless absolutely critical.]"
+            )
+        if progress >= self._budget_caution_threshold:
+            return (
+                f"[BUDGET: Iteration {api_call_count}/{self.max_iterations}. "
+                f"{remaining} iterations left. Start consolidating your work.]"
+            )
+        return None
+
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Request a summary when max iterations are reached. Returns the final response text."""
         print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
@@ -2952,11 +3139,14 @@ class AIAgent:
         try:
             # Build API messages, stripping internal-only fields
             # (finish_reason, reasoning) that strict APIs like Mistral reject with 422
+            _is_strict_api = "api.mistral.ai" in self.base_url.lower()
             api_messages = []
             for msg in messages:
                 api_msg = msg.copy()
                 for internal_field in ("reasoning", "finish_reason"):
                     api_msg.pop(internal_field, None)
+                if _is_strict_api:
+                    self._sanitize_tool_calls_for_strict_api(api_msg)
                 api_messages.append(api_msg)
 
             effective_system = self._cached_system_prompt or ""
@@ -3013,12 +3203,20 @@ class AIAgent:
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
-                summary_response = self.client.chat.completions.create(**summary_kwargs)
-
-                if summary_response.choices and summary_response.choices[0].message.content:
-                    final_response = summary_response.choices[0].message.content
+                if self.api_mode == "anthropic_messages":
+                    from agent.anthropic_adapter import build_anthropic_kwargs as _bak, normalize_anthropic_response as _nar
+                    _ant_kw = _bak(model=self.model, messages=api_messages, tools=None,
+                                   max_tokens=self.max_tokens, reasoning_config=self.reasoning_config)
+                    summary_response = self._anthropic_client.messages.create(**_ant_kw)
+                    _msg, _ = _nar(summary_response)
+                    final_response = (_msg.content or "").strip()
                 else:
-                    final_response = ""
+                    summary_response = self.client.chat.completions.create(**summary_kwargs)
+
+                    if summary_response.choices and summary_response.choices[0].message.content:
+                        final_response = summary_response.choices[0].message.content
+                    else:
+                        final_response = ""
 
             if final_response:
                 if "<think>" in final_response:
@@ -3035,6 +3233,13 @@ class AIAgent:
                     retry_response = self._run_codex_stream(codex_kwargs)
                     retry_msg, _ = self._normalize_codex_response(retry_response)
                     final_response = (retry_msg.content or "").strip() if retry_msg else ""
+                elif self.api_mode == "anthropic_messages":
+                    from agent.anthropic_adapter import build_anthropic_kwargs as _bak2, normalize_anthropic_response as _nar2
+                    _ant_kw2 = _bak2(model=self.model, messages=api_messages, tools=None,
+                                     max_tokens=self.max_tokens, reasoning_config=self.reasoning_config)
+                    retry_response = self._anthropic_client.messages.create(**_ant_kw2)
+                    _retry_msg, _ = _nar2(retry_response)
+                    final_response = (_retry_msg.content or "").strip()
                 else:
                     summary_kwargs = {
                         "model": self.model,
@@ -3087,6 +3292,11 @@ class AIAgent:
         Returns:
             Dict: Complete conversation result with final response and message history
         """
+        # Guard stdout against OSError from broken pipes (systemd/headless/daemon).
+        # Installed once, transparent when stdout is healthy, prevents crash on write.
+        if not isinstance(sys.stdout, _SafeWriter):
+            sys.stdout = _SafeWriter(sys.stdout)
+
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
         effective_task_id = task_id or str(uuid.uuid4())
         
@@ -3330,6 +3540,12 @@ class AIAgent:
                 # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
                 if "finish_reason" in api_msg:
                     api_msg.pop("finish_reason")
+                # Strip Codex Responses API fields (call_id, response_item_id) for
+                # strict providers like Mistral that reject unknown fields with 422.
+                # Uses new dicts so the internal messages list retains the fields
+                # for Codex Responses compatibility.
+                if "api.mistral.ai" in self.base_url.lower():
+                    self._sanitize_tool_calls_for_strict_api(api_msg)
                 # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
                 # The signature field helps maintain reasoning continuity
                 api_messages.append(api_msg)
@@ -3399,10 +3615,11 @@ class AIAgent:
             
             api_start_time = time.time()
             retry_count = 0
-            max_retries = 6  # Increased to allow longer backoff periods
+            max_retries = 3
             compression_attempts = 0
             max_compression_attempts = 3
             codex_auth_retry_attempted = False
+            anthropic_auth_retry_attempted = False
             nous_auth_retry_attempted = False
             restart_with_compressed_messages = False
             restart_with_length_continuation = False
@@ -3453,6 +3670,17 @@ class AIAgent:
                         elif len(output_items) == 0:
                             response_invalid = True
                             error_details.append("response.output is empty")
+                    elif self.api_mode == "anthropic_messages":
+                        content_blocks = getattr(response, "content", None) if response is not None else None
+                        if response is None:
+                            response_invalid = True
+                            error_details.append("response is None")
+                        elif not isinstance(content_blocks, list):
+                            response_invalid = True
+                            error_details.append("response.content is not a list")
+                        elif len(content_blocks) == 0:
+                            response_invalid = True
+                            error_details.append("response.content is empty")
                     else:
                         if response is None or not hasattr(response, 'choices') or response.choices is None or len(response.choices) == 0:
                             response_invalid = True
@@ -3554,6 +3782,9 @@ class AIAgent:
                             finish_reason = "length"
                         else:
                             finish_reason = "stop"
+                    elif self.api_mode == "anthropic_messages":
+                        stop_reason_map = {"end_turn": "stop", "tool_use": "tool_calls", "max_tokens": "length", "stop_sequence": "stop"}
+                        finish_reason = stop_reason_map.get(response.stop_reason, "stop")
                     else:
                         finish_reason = response.choices[0].finish_reason
 
@@ -3631,7 +3862,7 @@ class AIAgent:
                     
                     # Track actual token usage from response for context management
                     if hasattr(response, 'usage') and response.usage:
-                        if self.api_mode == "codex_responses":
+                        if self.api_mode in ("codex_responses", "anthropic_messages"):
                             prompt_tokens = getattr(response.usage, 'input_tokens', 0) or 0
                             completion_tokens = getattr(response.usage, 'output_tokens', 0) or 0
                             total_tokens = (
@@ -3666,9 +3897,15 @@ class AIAgent:
                         
                         # Log cache hit stats when prompt caching is active
                         if self._use_prompt_caching:
-                            details = getattr(response.usage, 'prompt_tokens_details', None)
-                            cached = getattr(details, 'cached_tokens', 0) or 0 if details else 0
-                            written = getattr(details, 'cache_write_tokens', 0) or 0 if details else 0
+                            if self.api_mode == "anthropic_messages":
+                                # Anthropic uses cache_read_input_tokens / cache_creation_input_tokens
+                                cached = getattr(response.usage, 'cache_read_input_tokens', 0) or 0
+                                written = getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
+                            else:
+                                # OpenRouter uses prompt_tokens_details.cached_tokens
+                                details = getattr(response.usage, 'prompt_tokens_details', None)
+                                cached = getattr(details, 'cached_tokens', 0) or 0 if details else 0
+                                written = getattr(details, 'cache_write_tokens', 0) or 0 if details else 0
                             prompt = usage_dict["prompt_tokens"]
                             hit_pct = (cached / prompt * 100) if prompt > 0 else 0
                             if not self.quiet_mode:
@@ -3717,6 +3954,21 @@ class AIAgent:
                         nous_auth_retry_attempted = True
                         if self._try_refresh_nous_client_credentials(force=True):
                             print(f"{self.log_prefix}🔐 Nous agent key refreshed after 401. Retrying request...")
+                            continue
+                    if (
+                        self.api_mode == "anthropic_messages"
+                        and status_code == 401
+                        and hasattr(self, '_anthropic_api_key')
+                        and not anthropic_auth_retry_attempted
+                    ):
+                        anthropic_auth_retry_attempted = True
+                        # Try re-reading Claude Code credentials (they may have been refreshed)
+                        from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
+                        new_token = resolve_anthropic_token()
+                        if new_token and new_token != self._anthropic_api_key:
+                            self._anthropic_api_key = new_token
+                            self._anthropic_client = build_anthropic_client(new_token)
+                            print(f"{self.log_prefix}🔐 Anthropic credentials refreshed after 401. Retrying request...")
                             continue
 
                     retry_count += 1
@@ -3802,6 +4054,7 @@ class AIAgent:
                         'token limit', 'too many tokens', 'reduce the length',
                         'exceeds the limit', 'context window',
                         'request entity too large',  # OpenRouter/Nous 413 safety net
+                        'prompt is too long',  # Anthropic: "prompt is too long: N tokens > M maximum"
                     ])
                     
                     if is_context_length_error:
@@ -3869,8 +4122,11 @@ class AIAgent:
                     # These indicate a problem with the request itself (bad model ID,
                     # invalid API key, forbidden, etc.) and will never succeed on retry.
                     # Note: 413 and context-length errors are excluded — handled above.
+                    # Also catch local validation errors (ValueError, TypeError) — these
+                    # are programming bugs, not transient failures.
+                    is_local_validation_error = isinstance(api_error, (ValueError, TypeError))
                     is_client_status_error = isinstance(status_code, int) and 400 <= status_code < 500 and status_code != 413
-                    is_client_error = (is_client_status_error or any(phrase in error_msg for phrase in [
+                    is_client_error = (is_local_validation_error or is_client_status_error or any(phrase in error_msg for phrase in [
                         'error code: 401', 'error code: 403',
                         'error code: 404', 'error code: 422',
                         'is not a valid model', 'invalid model', 'model not found',
@@ -3956,6 +4212,9 @@ class AIAgent:
             try:
                 if self.api_mode == "codex_responses":
                     assistant_message, finish_reason = self._normalize_codex_response(response)
+                elif self.api_mode == "anthropic_messages":
+                    from agent.anthropic_adapter import normalize_anthropic_response
+                    assistant_message, finish_reason = normalize_anthropic_response(response)
                 else:
                     assistant_message = response.choices[0].message
                 
@@ -4183,7 +4442,8 @@ class AIAgent:
                     
                     messages.append(assistant_msg)
                     
-                    self._execute_tool_calls(assistant_message, messages, effective_task_id)
+                    _msg_count_before_tools = len(messages)
+                    self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
                     # Refund the iteration if the ONLY tool(s) called were
                     # execute_code (programmatic tool calling).  These are
@@ -4192,7 +4452,20 @@ class AIAgent:
                     if _tc_names == {"execute_code"}:
                         self.iteration_budget.refund()
                     
-                    if self.compression_enabled and self.context_compressor.should_compress():
+                    # Estimate next prompt size using real token counts from the
+                    # last API response + rough estimate of newly appended tool
+                    # results.  This catches cases where tool results push the
+                    # context past the limit that last_prompt_tokens alone misses
+                    # (e.g. large file reads, web extractions).
+                    _compressor = self.context_compressor
+                    _new_tool_msgs = messages[_msg_count_before_tools:]
+                    _new_chars = sum(len(str(m.get("content", "") or "")) for m in _new_tool_msgs)
+                    _estimated_next_prompt = (
+                        _compressor.last_prompt_tokens
+                        + _compressor.last_completion_tokens
+                        + _new_chars // 3  # conservative: JSON-heavy tool results ≈ 3 chars/token
+                    )
+                    if self.compression_enabled and _compressor.should_compress(_estimated_next_prompt):
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message,
                             approx_tokens=self.context_compressor.last_prompt_tokens,
@@ -4415,9 +4688,17 @@ class AIAgent:
         if final_response and not interrupted:
             self._honcho_sync(original_user_message, final_response)
 
+        # Extract reasoning from the last assistant message (if any)
+        last_reasoning = None
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant" and msg.get("reasoning"):
+                last_reasoning = msg["reasoning"]
+                break
+
         # Build result with interrupt info if applicable
         result = {
             "final_response": final_response,
+            "last_reasoning": last_reasoning,
             "messages": messages,
             "api_calls": api_call_count,
             "completed": completed,
