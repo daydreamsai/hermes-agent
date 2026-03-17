@@ -889,6 +889,7 @@ def setup_model_provider(config: dict):
         "OpenCode Go (open models, $10/month subscription)",
         "GitHub Copilot (uses GITHUB_TOKEN or gh auth token)",
         "GitHub Copilot ACP (spawns `copilot --acp --stdio`)",
+        "xgate (ai.xgate.run inference endpoint)",
         "Hugging Face Inference Providers (20+ open models)",
     ]
     if keep_label:
@@ -1534,7 +1535,39 @@ def setup_model_provider(config: dict):
         _set_model_provider(config, "copilot-acp", pconfig.inference_base_url)
         selected_base_url = pconfig.inference_base_url
 
-    elif provider_idx == 16:  # Hugging Face Inference Providers
+    elif provider_idx == 16:  # xgate
+        selected_provider = "xgate"
+        print()
+        print_header("xgate API Key")
+        pconfig = PROVIDER_REGISTRY["xgate"]
+        print_info(f"Provider: {pconfig.name}")
+        print_info(f"Base URL: {pconfig.inference_base_url}")
+        print_info("Configure an API key if your xgate deployment requires one.")
+        print()
+
+        existing_key = get_env_value("XGATE_API_KEY")
+        if existing_key:
+            print_info(f"Current: {existing_key[:8]}... (configured)")
+            if prompt_yes_no("Update API key?", False):
+                api_key = prompt_text("xgate API key", password=True)
+                if api_key:
+                    save_env_value("XGATE_API_KEY", api_key)
+                    print_success("xgate API key updated")
+        else:
+            api_key = prompt_text("xgate API key", password=True)
+            if api_key:
+                save_env_value("XGATE_API_KEY", api_key)
+                print_success("xgate API key saved")
+            else:
+                print_warning("Skipped - agent won't work without an API key")
+
+        if existing_custom:
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+        _set_model_provider(config, "xgate", pconfig.inference_base_url)
+        selected_base_url = pconfig.inference_base_url
+
+    elif provider_idx == 17:  # Hugging Face Inference Providers
         selected_provider = "huggingface"
         print()
         print_header("Hugging Face API Token")
@@ -1553,7 +1586,7 @@ def setup_model_provider(config: dict):
         _set_model_provider(config, "huggingface", pconfig.inference_base_url)
         selected_base_url = pconfig.inference_base_url
 
-    # else: provider_idx == 17 (Keep current) — only shown when a provider already exists
+    # else: provider_idx == 18 (Keep current) — only shown when a provider already exists
     # Normalize "keep current" to an explicit provider so downstream logic
     # doesn't fall back to the generic OpenRouter/static-model path.
     if selected_provider is None:
@@ -1734,7 +1767,7 @@ def setup_model_provider(config: dict):
             model_cfg = _model_config_dict(config)
             model_cfg["api_mode"] = "chat_completions"
             config["model"] = model_cfg
-        elif selected_provider in ("copilot", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode", "ai-gateway", "opencode-zen", "opencode-go", "alibaba"):
+        elif selected_provider in ("copilot", "zai", "kimi-coding", "minimax", "minimax-cn", "xgate", "kilocode", "ai-gateway", "opencode-zen", "opencode-go", "alibaba", "huggingface"):
             _setup_provider_model_selection(
                 config, selected_provider, current_model,
                 prompt_choice, prompt,
@@ -1795,7 +1828,7 @@ def setup_model_provider(config: dict):
     # Write provider+base_url to config.yaml only after model selection is complete.
     # This prevents a race condition where the gateway picks up a new provider
     # before the model name has been updated to match.
-    if selected_provider in ("copilot-acp", "copilot", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode", "anthropic") and selected_base_url is not None:
+    if selected_provider in ("copilot-acp", "copilot", "zai", "kimi-coding", "minimax", "minimax-cn", "xgate", "kilocode", "anthropic", "huggingface") and selected_base_url is not None:
         _update_config_for_provider(selected_provider, selected_base_url)
 
     save_config(config)
