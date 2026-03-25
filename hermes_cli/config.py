@@ -47,37 +47,12 @@ from hermes_cli.default_soul import DEFAULT_SOUL_MD
 
 
 # =============================================================================
-# Managed mode (NixOS declarative config)
-# =============================================================================
-
-def is_managed() -> bool:
-    """Check if hermes is running in Nix-managed mode.
-
-    Two signals: the HERMES_MANAGED env var (set by the systemd service),
-    or a .managed marker file in HERMES_HOME (set by the NixOS activation
-    script, so interactive shells also see it).
-    """
-    if os.getenv("HERMES_MANAGED", "").lower() in ("true", "1", "yes"):
-        return True
-    managed_marker = get_hermes_home() / ".managed"
-    return managed_marker.exists()
-
-def managed_error(action: str = "modify configuration"):
-    """Print user-friendly error for managed mode."""
-    print(
-        f"Cannot {action}: configuration is managed by NixOS (HERMES_MANAGED=true).\n"
-        "Edit services.hermes-agent.settings in your configuration.nix and run:\n"
-        "  sudo nixos-rebuild switch",
-        file=sys.stderr,
-    )
-
-
-# =============================================================================
 # Config paths
 # =============================================================================
 
-# Re-export from hermes_constants — canonical definition lives there.
-from hermes_constants import get_hermes_home  # noqa: F811,E402
+def get_hermes_home() -> Path:
+    """Get the Hermes home directory (~/.hermes)."""
+    return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 
 def get_config_path() -> Path:
     """Get the main config file path."""
@@ -144,10 +119,6 @@ DEFAULT_CONFIG = {
         "backend": "local",
         "cwd": ".",  # Use current directory
         "timeout": 180,
-        # Environment variables to pass through to sandboxed execution
-        # (terminal and execute_code).  Skill-declared required_environment_variables
-        # are passed through automatically; this list is for non-skill use cases.
-        "env_passthrough": [],
         "docker_image": "nikolaik/python-nodejs:python3.11-nodejs20",
         "docker_forward_env": [],
         "singularity_image": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
@@ -174,7 +145,6 @@ DEFAULT_CONFIG = {
     
     "browser": {
         "inactivity_timeout": 120,
-        "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
     },
 
@@ -188,10 +158,8 @@ DEFAULT_CONFIG = {
     
     "compression": {
         "enabled": True,
-        "threshold": 0.50,            # compress when context usage exceeds this ratio
-        "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
-        "protect_last_n": 20,         # minimum recent messages to keep uncompressed
-        "summary_model": "",          # empty = use main configured model
+        "threshold": 0.50,
+        "summary_model": "google/gemini-3-flash-preview",
         "summary_provider": "auto",
         "summary_base_url": None,
     },
@@ -214,7 +182,6 @@ DEFAULT_CONFIG = {
             "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"
             "base_url": "",        # direct OpenAI-compatible endpoint (takes precedence over provider)
             "api_key": "",         # API key for base_url (falls back to OPENAI_API_KEY)
-            "timeout": 30,         # seconds — increase for slow local vision models
         },
         "web_extract": {
             "provider": "auto",
@@ -269,6 +236,7 @@ DEFAULT_CONFIG = {
         "streaming": False,
         "show_cost": False,       # Show $ cost in the status bar (off by default)
         "skin": "default",
+        "theme_mode": "auto",
     },
 
     # Privacy settings
@@ -342,8 +310,6 @@ DEFAULT_CONFIG = {
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
-        "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
-                               # independent of the parent's max_iterations)
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -365,14 +331,6 @@ DEFAULT_CONFIG = {
         "require_mention": True,       # Require @mention to respond in server channels
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
-    },
-
-    # WhatsApp platform settings (gateway mode)
-    "whatsapp": {
-        # Reply prefix prepended to every outgoing WhatsApp message.
-        # Default (None) uses the built-in "⚕ *Hermes Agent*" header.
-        # Set to "" (empty string) to disable the header entirely.
-        # Supports \n for newlines, e.g. "🤖 *My Bot*\n──────\n"
     },
 
     # Approval mode for dangerous commands:
@@ -407,7 +365,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 10,
+    "_config_version": 9,
 }
 
 # =============================================================================
@@ -556,6 +514,62 @@ OPTIONAL_ENV_VARS = {
         "description": "Custom xgate base URL (advanced)",
         "prompt": "xgate Base URL",
         "url": "https://ai.xgate.run/v1",
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "XGATE_AUTH_HELPER_CMD": {
+        "description": "Command that prints JSON headers for xgate auth",
+        "prompt": "xgate auth helper command",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "XGATE_REQUEST_HEADERS_JSON": {
+        "description": "Static xgate request headers as a JSON object",
+        "prompt": "xgate request headers JSON",
+        "url": None,
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
+    "X402_PRIVATE_KEY": {
+        "description": "Private key for signing x402 payments",
+        "prompt": "x402 private key",
+        "url": None,
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
+    "X402_RPC_URL": {
+        "description": "RPC URL override for x402 Permit2 / EIP-2612 reads",
+        "prompt": "x402 RPC URL",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "X402_NETWORK": {
+        "description": "Preferred CAIP-2 network for x402 payments (optional)",
+        "prompt": "x402 preferred network",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "X402_PERMIT_CAP_USDC": {
+        "description": "Default x402 upto permit cap in USDC",
+        "prompt": "x402 default permit cap (USDC)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "X402_TASKMARKET_KEYSTORE_PATH": {
+        "description": "Override path to Taskmarket keystore.json for x402 signing",
+        "prompt": "Taskmarket keystore path",
+        "url": None,
         "password": False,
         "category": "provider",
         "advanced": True,
@@ -721,11 +735,6 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "tool",
     },
-    "HONCHO_BASE_URL": {
-        "description": "Base URL for self-hosted Honcho instances (no API key needed)",
-        "prompt": "Honcho base URL (e.g. http://localhost:8000)",
-        "category": "tool",
-    },
 
     # ── Messaging platforms ──
     "TELEGRAM_BOT_TOKEN": {
@@ -830,59 +839,6 @@ OPTIONAL_ENV_VARS = {
         "password": False,
         "category": "messaging",
         "advanced": True,
-    },
-    "API_SERVER_ENABLED": {
-        "description": "Enable the OpenAI-compatible API server (true/false). Allows frontends like Open WebUI, LobeChat, etc. to connect.",
-        "prompt": "Enable API server (true/false)",
-        "url": None,
-        "password": False,
-        "category": "messaging",
-        "advanced": True,
-    },
-    "API_SERVER_KEY": {
-        "description": "Bearer token for API server authentication. If empty, all requests are allowed (local use only).",
-        "prompt": "API server auth key (optional)",
-        "url": None,
-        "password": True,
-        "category": "messaging",
-        "advanced": True,
-    },
-    "API_SERVER_PORT": {
-        "description": "Port for the API server (default: 8642).",
-        "prompt": "API server port",
-        "url": None,
-        "password": False,
-        "category": "messaging",
-        "advanced": True,
-    },
-    "API_SERVER_HOST": {
-        "description": "Host/bind address for the API server (default: 127.0.0.1). Use 0.0.0.0 for network access — requires API_SERVER_KEY for security.",
-        "prompt": "API server host",
-        "url": None,
-        "password": False,
-        "category": "messaging",
-        "advanced": True,
-    },
-    "WEBHOOK_ENABLED": {
-        "description": "Enable the webhook platform adapter for receiving events from GitHub, GitLab, etc.",
-        "prompt": "Enable webhooks (true/false)",
-        "url": None,
-        "password": False,
-        "category": "messaging",
-    },
-    "WEBHOOK_PORT": {
-        "description": "Port for the webhook HTTP server (default: 8644).",
-        "prompt": "Webhook port",
-        "url": None,
-        "password": False,
-        "category": "messaging",
-    },
-    "WEBHOOK_SECRET": {
-        "description": "Global HMAC secret for webhook signature validation (overridable per route in config.yaml).",
-        "prompt": "Webhook secret",
-        "url": None,
-        "password": True,
-        "category": "messaging",
     },
 
     # ── Agent settings ──
@@ -1222,26 +1178,6 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def _expand_env_vars(obj):
-    """Recursively expand ``${VAR}`` references in config values.
-
-    Only string values are processed; dict keys, numbers, booleans, and
-    None are left untouched.  Unresolved references (variable not in
-    ``os.environ``) are kept verbatim so callers can detect them.
-    """
-    if isinstance(obj, str):
-        return re.sub(
-            r"\${([^}]+)}",
-            lambda m: os.environ.get(m.group(1), m.group(0)),
-            obj,
-        )
-    if isinstance(obj, dict):
-        return {k: _expand_env_vars(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_expand_env_vars(item) for item in obj]
-    return obj
-
-
 def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize legacy root-level max_turns into agent.max_turns."""
     config = dict(config)
@@ -1283,7 +1219,7 @@ def load_config() -> Dict[str, Any]:
         except Exception as e:
             print(f"Warning: Failed to load config: {e}")
     
-    return _expand_env_vars(_normalize_max_turns_config(config))
+    return _normalize_max_turns_config(config)
 
 
 _SECURITY_COMMENT = """
@@ -1383,9 +1319,6 @@ _COMMENTED_SECTIONS = """
 
 def save_config(config: Dict[str, Any]):
     """Save configuration to ~/.hermes/config.yaml."""
-    if is_managed():
-        managed_error("save configuration")
-        return
     from utils import atomic_yaml_write
 
     ensure_hermes_home()
@@ -1527,9 +1460,6 @@ def sanitize_env_file() -> int:
 
 def save_env_value(key: str, value: str):
     """Save or update a value in ~/.hermes/.env."""
-    if is_managed():
-        managed_error(f"set {key}")
-        return
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
     value = value.replace("\n", "").replace("\r", "")
@@ -1684,6 +1614,7 @@ def show_config():
     print(color("◆ Model", Colors.CYAN, Colors.BOLD))
     print(f"  Model:        {config.get('model', 'not set')}")
     print(f"  Max turns:    {config.get('agent', {}).get('max_turns', DEFAULT_CONFIG['agent']['max_turns'])}")
+    print(f"  Toolsets:     {', '.join(config.get('toolsets', ['all']))}")
     
     # Display
     print()
@@ -1702,11 +1633,11 @@ def show_config():
     print(f"  Timeout:      {terminal.get('timeout', 60)}s")
     
     if terminal.get('backend') == 'docker':
-        print(f"  Docker image: {terminal.get('docker_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
+        print(f"  Docker image: {terminal.get('docker_image', 'python:3.11-slim')}")
     elif terminal.get('backend') == 'singularity':
-        print(f"  Image:        {terminal.get('singularity_image', 'docker://nikolaik/python-nodejs:python3.11-nodejs20')}")
+        print(f"  Image:        {terminal.get('singularity_image', 'docker://python:3.11')}")
     elif terminal.get('backend') == 'modal':
-        print(f"  Modal image:  {terminal.get('modal_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
+        print(f"  Modal image:  {terminal.get('modal_image', 'python:3.11')}")
         modal_token = get_env_value('MODAL_TOKEN_ID')
         print(f"  Modal token:  {'configured' if modal_token else '(not set)'}")
     elif terminal.get('backend') == 'daytona':
@@ -1736,10 +1667,7 @@ def show_config():
     print(f"  Enabled:      {'yes' if enabled else 'no'}")
     if enabled:
         print(f"  Threshold:    {compression.get('threshold', 0.50) * 100:.0f}%")
-        print(f"  Target ratio: {compression.get('target_ratio', 0.20) * 100:.0f}% of threshold preserved")
-        print(f"  Protect last: {compression.get('protect_last_n', 20)} messages")
-        _sm = compression.get('summary_model', '') or '(main model)'
-        print(f"  Model:        {_sm}")
+        print(f"  Model:        {compression.get('summary_model', 'google/gemini-3-flash-preview')}")
         comp_provider = compression.get('summary_provider', 'auto')
         if comp_provider != 'auto':
             print(f"  Provider:     {comp_provider}")
@@ -1786,9 +1714,6 @@ def show_config():
 
 def edit_config():
     """Open config file in user's editor."""
-    if is_managed():
-        managed_error("edit configuration")
-        return
     config_path = get_config_path()
     
     # Ensure config exists
@@ -1818,9 +1743,6 @@ def edit_config():
 
 def set_config_value(key: str, value: str):
     """Set a configuration value."""
-    if is_managed():
-        managed_error("set configuration values")
-        return
     # Check if it's an API key (goes to .env)
     api_keys = [
         'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',

@@ -3,6 +3,7 @@ import sys
 import types
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from hermes_cli.auth import AuthError
 from hermes_cli import main as hermes_main
@@ -235,13 +236,13 @@ def test_runtime_resolution_passes_request_headers_resolver_to_agent(monkeypatch
 
     def _runtime_resolve(**kwargs):
         return {
-            "provider": "header-hook-provider",
+            "provider": "xgate",
             "api_mode": "chat_completions",
-            "base_url": "https://headers.example/v1",
-            "api_key": "placeholder-key",
+            "base_url": "https://ai.xgate.run/v1",
+            "api_key": "xgate-placeholder",
             "source": "env/config",
             "request_headers_resolver": resolver,
-            "request_headers_key": "helper:test-provider",
+            "request_headers_key": "helper:xgate",
         }
 
     class _DummyAgent:
@@ -445,7 +446,7 @@ def test_model_flow_custom_saves_verified_v1_base_url(monkeypatch, capsys):
     )
     monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: None)
 
-    answers = iter(["http://localhost:8000", "local-key", "llm", ""])
+    answers = iter(["http://localhost:8000", "local-key", "llm"])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
 
     hermes_main._model_flow_custom({})
@@ -455,3 +456,32 @@ def test_model_flow_custom_saves_verified_v1_base_url(monkeypatch, capsys):
     assert saved_env["OPENAI_BASE_URL"] == "http://localhost:8000/v1"
     assert saved_env["OPENAI_API_KEY"] == "local-key"
     assert saved_env["MODEL"] == "llm"
+
+
+def test_model_flow_xgate_clears_optional_overrides(monkeypatch):
+    saved_env = {}
+    saved_configs = []
+    answers = iter(["", "", "", "", "router-model"])
+
+    monkeypatch.setattr("hermes_cli.config.get_env_value", lambda key: {
+        "XGATE_BASE_URL": "https://ai.xgate.run/v1",
+        "X402_RPC_URL": "https://rpc.example",
+        "X402_NETWORK": "eip155:8453",
+        "X402_PERMIT_CAP_USDC": "3",
+        "OPENAI_BASE_URL": "",
+    }.get(key, ""))
+    monkeypatch.setattr("hermes_cli.config.save_env_value", lambda key, value: saved_env.__setitem__(key, value))
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"model": {"default": "old-model"}})
+    monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: saved_configs.append(cfg))
+    monkeypatch.setattr("hermes_cli.auth._save_model_choice", lambda model: None)
+    monkeypatch.setattr("hermes_cli.auth.deactivate_provider", lambda: None)
+    monkeypatch.setattr("hermes_cli.taskmarket_wallet.taskmarket_keystore_exists", lambda: True)
+
+    with patch("builtins.input", side_effect=lambda prompt="": next(answers)):
+        hermes_main._model_flow_xgate({}, current_model="")
+
+    assert saved_env["XGATE_BASE_URL"] == "https://ai.xgate.run/v1"
+    assert saved_env["X402_RPC_URL"] == ""
+    assert saved_env["X402_NETWORK"] == ""
+    assert saved_env["X402_PERMIT_CAP_USDC"] == "3"
+    assert saved_configs[-1]["model"]["provider"] == "xgate"

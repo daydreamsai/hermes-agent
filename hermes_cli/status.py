@@ -198,9 +198,20 @@ def show_status(args):
         "Kimi / Moonshot":  ("KIMI_API_KEY",),
         "MiniMax":          ("MINIMAX_API_KEY",),
         "MiniMax (China)":  ("MINIMAX_CN_API_KEY",),
-        "xgate":            ("XGATE_API_KEY",),
+        "xgate":            ("XGATE_API_KEY", "XGATE_AUTH_HELPER_CMD", "XGATE_REQUEST_HEADERS_JSON"),
     }
     for pname, env_vars in apikey_providers.items():
+        if pname == "xgate":
+            try:
+                from hermes_cli.auth import get_api_key_provider_status
+
+                xgate_status = get_api_key_provider_status("xgate")
+                configured = bool(xgate_status.get("configured"))
+                label = "configured" if configured else "not configured (run: hermes model)"
+                print(f"  {pname:<16} {check_mark(configured)} {label}")
+                continue
+            except Exception:
+                pass
         key_val = ""
         for ev in env_vars:
             key_val = get_env_value(ev) or ""

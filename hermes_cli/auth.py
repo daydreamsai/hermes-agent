@@ -18,8 +18,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import shlex
+import shutil
 import stat
 import base64
 import hashlib
@@ -67,12 +67,11 @@ DEFAULT_AGENT_KEY_MIN_TTL_SECONDS = 30 * 60  # 30 minutes
 ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120       # refresh 2 min before expiry
 DEVICE_AUTH_POLL_INTERVAL_CAP_SECONDS = 1     # poll at most every 1s
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
-DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
-DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
 DEFAULT_XGATE_BASE_URL = "https://ai.xgate.run/v1"
+DEFAULT_REQUEST_HEADER_HELPER_TIMEOUT_SECONDS = 20.0
 
 
 # =============================================================================
@@ -112,20 +111,6 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="oauth_external",
         inference_base_url=DEFAULT_CODEX_BASE_URL,
     ),
-    "copilot": ProviderConfig(
-        id="copilot",
-        name="GitHub Copilot",
-        auth_type="api_key",
-        inference_base_url=DEFAULT_GITHUB_MODELS_BASE_URL,
-        api_key_env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
-    ),
-    "copilot-acp": ProviderConfig(
-        id="copilot-acp",
-        name="GitHub Copilot ACP",
-        auth_type="external_process",
-        inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
-        base_url_env_var="COPILOT_ACP_BASE_URL",
-    ),
     "zai": ProviderConfig(
         id="zai",
         name="Z.AI / GLM",
@@ -146,7 +131,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         id="minimax",
         name="MiniMax",
         auth_type="api_key",
-        inference_base_url="https://api.minimax.io/anthropic",
+        inference_base_url="https://api.minimax.io/v1",
         api_key_env_vars=("MINIMAX_API_KEY",),
         base_url_env_var="MINIMAX_BASE_URL",
     ),
@@ -169,7 +154,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         id="minimax-cn",
         name="MiniMax (China)",
         auth_type="api_key",
-        inference_base_url="https://api.minimaxi.com/anthropic",
+        inference_base_url="https://api.minimaxi.com/v1",
         api_key_env_vars=("MINIMAX_CN_API_KEY",),
         base_url_env_var="MINIMAX_CN_BASE_URL",
     ),
@@ -196,6 +181,9 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url=DEFAULT_XGATE_BASE_URL,
         api_key_env_vars=("XGATE_API_KEY",),
         base_url_env_var="XGATE_BASE_URL",
+        extra={
+            "headers_json_env_var": "XGATE_REQUEST_HEADERS_JSON",
+        },
     ),
     "opencode-zen": ProviderConfig(
         id="opencode-zen",
@@ -208,9 +196,9 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
     "opencode-go": ProviderConfig(
         id="opencode-go",
         name="OpenCode Go",
-        auth_type="api_key",
+        auth_type="***",
         inference_base_url="https://opencode.ai/zen/go/v1",
-        api_key_env_vars=("OPENCODE_GO_API_KEY",),
+        api_key_env_vars=("OPEN...",),
         base_url_env_var="OPENCODE_GO_BASE_URL",
     ),
     "kilocode": ProviderConfig(
@@ -248,95 +236,126 @@ def _resolve_kimi_base_url(api_key: str, default_url: str, env_override: str) ->
     return default_url
 
 
-def _gh_cli_candidates() -> list[str]:
-    """Return candidate ``gh`` binary paths, including common Homebrew installs."""
-    candidates: list[str] = []
+def _make_request_headers_resolver(
+    *,
+    provider_id: str,
+    base_url: str,
+    helper_cmd: str,
+    static_headers_json: str,
+):
+    helper_cmd = helper_cmd.strip()
+    static_headers_json = static_headers_json.strip()
+    resolved_base_url = base_url.rstrip("/")
 
-    resolved = shutil.which("gh")
-    if resolved:
-        candidates.append(resolved)
+    def _resolver(
+        *,
+        force_refresh: bool = False,
+        api_kwargs: Optional[Dict[str, Any]] = None,
+        error: Optional[Exception] = None,
+    ) -> Dict[str, str]:
+        if helper_cmd:
+            payload: Dict[str, Any] = {
+                "provider": provider_id,
+                "base_url": resolved_base_url,
+                "force_refresh": bool(force_refresh),
+            }
+            if isinstance(api_kwargs, dict):
+                payload["request"] = {
+                    "model": api_kwargs.get("model"),
+                    "messages": len(api_kwargs.get("messages") or []),
+                }
+            if error is not None:
+                payload["error"] = {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                    "status_code": getattr(error, "status_code", None),
+                }
 
-    for candidate in (
-        "/opt/homebrew/bin/gh",
-        "/usr/local/bin/gh",
-        str(Path.home() / ".local" / "bin" / "gh"),
-    ):
-        if candidate in candidates:
-            continue
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            candidates.append(candidate)
+            try:
+                result = subprocess.run(
+                    shlex.split(helper_cmd),
+                    input=json.dumps(payload),
+                    capture_output=True,
+                    text=True,
+                    timeout=float(os.getenv("REQUEST_HEADER_HELPER_TIMEOUT_SECONDS", str(DEFAULT_REQUEST_HEADER_HELPER_TIMEOUT_SECONDS))),
+                    check=False,
+                )
+            except Exception as exc:
+                raise AuthError(
+                    f"{provider_id} auth helper failed to run: {exc}",
+                    provider=provider_id,
+                    code="request_header_helper_failed",
+                ) from exc
 
-    return candidates
+            if result.returncode != 0:
+                stderr = (result.stderr or "").strip()
+                raise AuthError(
+                    f"{provider_id} auth helper exited with status {result.returncode}: {stderr or 'no stderr'}",
+                    provider=provider_id,
+                    code="request_header_helper_failed",
+                )
 
+            try:
+                payload_out = json.loads((result.stdout or "").strip() or "{}")
+            except Exception as exc:
+                raise AuthError(
+                    f"{provider_id} auth helper returned invalid JSON.",
+                    provider=provider_id,
+                    code="request_header_helper_invalid_json",
+                ) from exc
 
-def _try_gh_cli_token() -> Optional[str]:
-    """Return a token from ``gh auth token`` when the GitHub CLI is available."""
-    for gh_path in _gh_cli_candidates():
-        try:
-            result = subprocess.run(
-                [gh_path, "auth", "token"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            logger.debug("gh CLI token lookup failed (%s): %s", gh_path, exc)
-            continue
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    return None
+            headers_obj = payload_out.get("headers", payload_out)
+            if not isinstance(headers_obj, dict):
+                raise AuthError(
+                    f"{provider_id} auth helper response must be a JSON object or {{'headers': {{...}}}}.",
+                    provider=provider_id,
+                    code="request_header_helper_invalid_shape",
+                )
 
+            headers = {
+                str(k): str(v)
+                for k, v in headers_obj.items()
+                if isinstance(k, str) and v is not None and str(v).strip()
+            }
+            if not headers:
+                raise AuthError(
+                    f"{provider_id} auth helper returned no headers.",
+                    provider=provider_id,
+                    code="request_header_helper_empty_headers",
+                )
+            return headers
 
-_PLACEHOLDER_SECRET_VALUES = {
-    "*",
-    "**",
-    "***",
-    "changeme",
-    "your_api_key",
-    "your-api-key",
-    "placeholder",
-    "example",
-    "dummy",
-    "null",
-    "none",
-}
+        if static_headers_json:
+            try:
+                parsed = json.loads(static_headers_json)
+            except Exception as exc:
+                raise AuthError(
+                    f"{provider_id} static request headers must be valid JSON.",
+                    provider=provider_id,
+                    code="request_header_json_invalid",
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise AuthError(
+                    f"{provider_id} static request headers must decode to a JSON object.",
+                    provider=provider_id,
+                    code="request_header_json_invalid_shape",
+                )
+            headers = {
+                str(k): str(v)
+                for k, v in parsed.items()
+                if isinstance(k, str) and v is not None and str(v).strip()
+            }
+            if not headers:
+                raise AuthError(
+                    f"{provider_id} static request headers JSON produced no headers.",
+                    provider=provider_id,
+                    code="request_header_json_empty",
+                )
+            return headers
 
+        return {}
 
-def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
-    """Return True when a configured secret looks usable, not empty/placeholder."""
-    if not isinstance(value, str):
-        return False
-    cleaned = value.strip()
-    if len(cleaned) < min_length:
-        return False
-    if cleaned.lower() in _PLACEHOLDER_SECRET_VALUES:
-        return False
-    return True
-
-
-def _resolve_api_key_provider_secret(
-    provider_id: str, pconfig: ProviderConfig
-) -> tuple[str, str]:
-    """Resolve an API-key provider's token and indicate where it came from."""
-    if provider_id == "copilot":
-        # Use the dedicated copilot auth module for proper token validation
-        try:
-            from hermes_cli.copilot_auth import resolve_copilot_token
-            token, source = resolve_copilot_token()
-            if token:
-                return token, source
-        except ValueError as exc:
-            logger.warning("Copilot token validation failed: %s", exc)
-        except Exception:
-            pass
-        return "", ""
-
-    for env_var in pconfig.api_key_env_vars:
-        val = os.getenv(env_var, "").strip()
-        if has_usable_secret(val):
-            return val, env_var
-
-    return "", ""
+    return _resolver
 
 
 # =============================================================================
@@ -689,9 +708,6 @@ def resolve_provider(
         "kimi": "kimi-coding", "moonshot": "kimi-coding",
         "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn",
         "claude": "anthropic", "claude-code": "anthropic",
-        "github": "copilot", "github-copilot": "copilot",
-        "github-models": "copilot", "github-model": "copilot",
-        "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
         "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
         "daydreams": "xgate",
         "opencode": "opencode-zen", "zen": "opencode-zen",
@@ -700,10 +716,8 @@ def resolve_provider(
     }
     normalized = _PROVIDER_ALIASES.get(normalized, normalized)
 
-    if normalized == "openrouter":
+    if normalized in {"openrouter", "custom"}:
         return "openrouter"
-    if normalized == "custom":
-        return "custom"
     if normalized in PROVIDER_REGISTRY:
         return normalized
     if normalized != "auto":
@@ -727,20 +741,22 @@ def resolve_provider(
     except Exception as e:
         logger.debug("Could not detect active auth provider: %s", e)
 
-    if has_usable_secret(os.getenv("OPENAI_API_KEY")) or has_usable_secret(os.getenv("OPENROUTER_API_KEY")):
+    if os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY"):
         return "openrouter"
+
+    if (
+        os.getenv("XGATE_API_KEY", "").strip()
+        or os.getenv("XGATE_AUTH_HELPER_CMD", "").strip()
+        or os.getenv("XGATE_REQUEST_HEADERS_JSON", "").strip()
+    ):
+        return "xgate"
 
     # Auto-detect API-key providers by checking their env vars
     for pid, pconfig in PROVIDER_REGISTRY.items():
         if pconfig.auth_type != "api_key":
             continue
-        # GitHub tokens are commonly present for repo/tool access but should not
-        # hijack inference auto-selection unless the user explicitly chooses
-        # Copilot/GitHub Models as the provider.
-        if pid == "copilot":
-            continue
         for env_var in pconfig.api_key_env_vars:
-            if has_usable_secret(os.getenv(env_var, "")):
+            if os.getenv(env_var, "").strip():
                 return pid
 
     return "openrouter"
@@ -1607,11 +1623,51 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
 
     api_key = ""
     key_source = ""
-    api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
+    for env_var in pconfig.api_key_env_vars:
+        val = os.getenv(env_var, "").strip()
+        if val:
+            api_key = val
+            key_source = env_var
+            break
 
     env_url = ""
     if pconfig.base_url_env_var:
         env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+
+    if provider_id == "xgate":
+        private_key = os.getenv("X402_PRIVATE_KEY", "").strip()
+        helper_cmd = os.getenv("XGATE_AUTH_HELPER_CMD", "").strip()
+        static_headers_json = os.getenv(str((pconfig.extra or {}).get("headers_json_env_var") or ""), "").strip()
+        taskmarket_available = False
+        normalized_private_key = None
+        if private_key:
+            try:
+                from hermes_cli.x402_auth import normalize_private_key as _normalize_x402_private_key
+
+                normalized_private_key = _normalize_x402_private_key(private_key)
+            except Exception:
+                normalized_private_key = None
+        if not normalized_private_key:
+            try:
+                from hermes_cli.taskmarket_wallet import taskmarket_keystore_exists
+
+                taskmarket_available = taskmarket_keystore_exists()
+            except Exception:
+                taskmarket_available = False
+        return {
+            "configured": bool(normalized_private_key or taskmarket_available or api_key or helper_cmd or static_headers_json),
+            "provider": provider_id,
+            "name": pconfig.name,
+            "key_source": (
+                ("X402_PRIVATE_KEY" if normalized_private_key else "")
+                or ("XGATE_AUTH_HELPER_CMD" if helper_cmd else "")
+                or ("XGATE_REQUEST_HEADERS_JSON" if static_headers_json else "")
+                or key_source
+                or ("taskmarket-keystore" if taskmarket_available else "")
+            ),
+            "base_url": (env_url or pconfig.inference_base_url).rstrip("/"),
+            "logged_in": bool(normalized_private_key or taskmarket_available or api_key or helper_cmd or static_headers_json),
+        }
 
     if provider_id == "kimi-coding":
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
@@ -1630,36 +1686,6 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
-def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
-    """Status snapshot for providers that run a local subprocess."""
-    pconfig = PROVIDER_REGISTRY.get(provider_id)
-    if not pconfig or pconfig.auth_type != "external_process":
-        return {"configured": False}
-
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
-
-    resolved_command = shutil.which(command) if command else None
-    return {
-        "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
-        "provider": provider_id,
-        "name": pconfig.name,
-        "command": command,
-        "args": args,
-        "resolved_command": resolved_command,
-        "base_url": base_url,
-        "logged_in": bool(resolved_command or base_url.startswith("acp+tcp://")),
-    }
-
-
 def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Generic auth status dispatcher."""
     target = provider_id or get_active_provider()
@@ -1667,8 +1693,6 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_nous_auth_status()
     if target == "openai-codex":
         return get_codex_auth_status()
-    if target == "copilot-acp":
-        return get_external_process_provider_status(target)
     # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
     if pconfig and pconfig.auth_type == "api_key":
@@ -1691,11 +1715,107 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
     api_key = ""
     key_source = ""
-    api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
+    for env_var in pconfig.api_key_env_vars:
+        val = os.getenv(env_var, "").strip()
+        if val:
+            api_key = val
+            key_source = env_var
+            break
 
     env_url = ""
     if pconfig.base_url_env_var:
         env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+
+    if provider_id == "xgate":
+        private_key = os.getenv("X402_PRIVATE_KEY", "").strip()
+        helper_cmd = os.getenv("XGATE_AUTH_HELPER_CMD", "").strip()
+        static_headers_json = os.getenv(str((pconfig.extra or {}).get("headers_json_env_var") or ""), "").strip()
+        base_url = (env_url or pconfig.inference_base_url).rstrip("/")
+        normalized_private_key = None
+        if private_key:
+            try:
+                from hermes_cli.x402_auth import normalize_private_key as _normalize_x402_private_key
+
+                normalized_private_key = _normalize_x402_private_key(private_key)
+            except Exception:
+                normalized_private_key = None
+        if normalized_private_key:
+            from hermes_cli.x402_auth import create_x402_request_headers_resolver
+
+            preferred_network = os.getenv("X402_NETWORK", "").strip() or None
+            rpc_url = os.getenv("X402_RPC_URL", "").strip() or None
+            permit_cap_units = None
+            permit_cap_usdc = os.getenv("X402_PERMIT_CAP_USDC", "").strip()
+            if permit_cap_usdc:
+                try:
+                    permit_cap_units = str(int(float(permit_cap_usdc) * 1_000_000))
+                except ValueError:
+                    permit_cap_units = None
+            return {
+                "provider": provider_id,
+                "api_key": api_key or "xgate-placeholder",
+                "base_url": base_url,
+                "source": "X402_PRIVATE_KEY",
+                "request_headers_resolver": create_x402_request_headers_resolver(
+                    private_key=normalized_private_key,
+                    base_url=base_url,
+                    preferred_network=preferred_network,
+                    rpc_url=rpc_url,
+                    permit_cap_units=permit_cap_units,
+                ),
+                "request_headers_key": f"pk:{preferred_network or 'auto'}|{rpc_url or 'default'}|{base_url}",
+            }
+        if helper_cmd or static_headers_json:
+            return {
+                "provider": provider_id,
+                "api_key": api_key or "xgate-placeholder",
+                "base_url": base_url,
+                "source": key_source or ("XGATE_AUTH_HELPER_CMD" if helper_cmd else "XGATE_REQUEST_HEADERS_JSON"),
+                "request_headers_resolver": _make_request_headers_resolver(
+                    provider_id=provider_id,
+                    base_url=base_url,
+                    helper_cmd=helper_cmd,
+                    static_headers_json=static_headers_json,
+                ),
+                "request_headers_key": (
+                    f"helper:{helper_cmd}|{base_url}"
+                    if helper_cmd else f"static-json:{base_url}"
+                ),
+            }
+        taskmarket_private_key = None
+        try:
+            from hermes_cli.taskmarket_wallet import load_taskmarket_private_key
+            from hermes_cli.x402_auth import normalize_private_key as _normalize_x402_private_key
+
+            taskmarket_private_key = _normalize_x402_private_key(load_taskmarket_private_key())
+        except Exception:
+            taskmarket_private_key = None
+        if taskmarket_private_key:
+            from hermes_cli.x402_auth import create_x402_request_headers_resolver
+
+            preferred_network = os.getenv("X402_NETWORK", "").strip() or None
+            rpc_url = os.getenv("X402_RPC_URL", "").strip() or None
+            permit_cap_units = None
+            permit_cap_usdc = os.getenv("X402_PERMIT_CAP_USDC", "").strip()
+            if permit_cap_usdc:
+                try:
+                    permit_cap_units = str(int(float(permit_cap_usdc) * 1_000_000))
+                except ValueError:
+                    permit_cap_units = None
+            return {
+                "provider": provider_id,
+                "api_key": api_key or "xgate-placeholder",
+                "base_url": base_url,
+                "source": "taskmarket-keystore",
+                "request_headers_resolver": create_x402_request_headers_resolver(
+                    private_key=taskmarket_private_key,
+                    base_url=base_url,
+                    preferred_network=preferred_network,
+                    rpc_url=rpc_url,
+                    permit_cap_units=permit_cap_units,
+                ),
+                "request_headers_key": f"taskmarket:{preferred_network or 'auto'}|{rpc_url or 'default'}|{base_url}",
+            }
 
     if provider_id == "kimi-coding":
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
@@ -1709,46 +1829,6 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
         "api_key": api_key,
         "base_url": base_url.rstrip("/"),
         "source": key_source or "default",
-    }
-
-
-def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str, Any]:
-    """Resolve runtime details for local subprocess-backed providers."""
-    pconfig = PROVIDER_REGISTRY.get(provider_id)
-    if not pconfig or pconfig.auth_type != "external_process":
-        raise AuthError(
-            f"Provider '{provider_id}' is not an external-process provider.",
-            provider=provider_id,
-            code="invalid_provider",
-        )
-
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
-
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    resolved_command = shutil.which(command) if command else None
-    if not resolved_command and not base_url.startswith("acp+tcp://"):
-        raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
-            provider=provider_id,
-            code="missing_copilot_cli",
-        )
-
-    return {
-        "provider": provider_id,
-        "api_key": "copilot-acp",
-        "base_url": base_url.rstrip("/"),
-        "command": resolved_command or command,
-        "args": args,
-        "source": "process",
     }
 
 
