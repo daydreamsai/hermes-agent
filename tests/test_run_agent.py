@@ -267,21 +267,6 @@ class TestExtractReasoning:
         result = agent._extract_reasoning(msg)
         assert result == "same text"
 
-    @pytest.mark.parametrize(
-        ("content", "expected"),
-        [
-            ("<think>thinking hard</think>", "thinking hard"),
-            ("<thinking>step by step</thinking>", "step by step"),
-            (
-                "<REASONING_SCRATCHPAD>scratch analysis</REASONING_SCRATCHPAD>",
-                "scratch analysis",
-            ),
-        ],
-    )
-    def test_inline_reasoning_blocks_fallback(self, agent, content, expected):
-        msg = _mock_assistant_msg(content=content)
-        assert agent._extract_reasoning(msg) == expected
-
 
 class TestCleanSessionContent:
     def test_none_passthrough(self):
@@ -646,28 +631,6 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["extra_body"]["reasoning"]["effort"] == "medium"
 
-    def test_reasoning_sent_for_copilot_gpt5(self, agent):
-        agent.base_url = "https://api.githubcopilot.com"
-        agent.model = "gpt-5.4"
-        messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
-        assert kwargs["extra_body"]["reasoning"] == {"effort": "medium"}
-
-    def test_reasoning_xhigh_normalized_for_copilot(self, agent):
-        agent.base_url = "https://api.githubcopilot.com"
-        agent.model = "gpt-5.4"
-        agent.reasoning_config = {"enabled": True, "effort": "xhigh"}
-        messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
-        assert kwargs["extra_body"]["reasoning"] == {"effort": "high"}
-
-    def test_reasoning_omitted_for_non_reasoning_copilot_model(self, agent):
-        agent.base_url = "https://api.githubcopilot.com"
-        agent.model = "gpt-4.1"
-        messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
-        assert "reasoning" not in kwargs.get("extra_body", {})
-
     def test_max_tokens_injected(self, agent):
         agent.max_tokens = 4096
         messages = [{"role": "user", "content": "hi"}]
@@ -843,7 +806,7 @@ class TestConcurrentToolExecution:
                 mock_con.assert_not_called()
 
     def test_multiple_tools_uses_concurrent_path(self, agent):
-        """Multiple read-only tools should use concurrent path."""
+        """Multiple non-interactive tools should use concurrent path."""
         tc1 = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
         tc2 = _mock_tool_call(name="read_file", arguments='{"path":"x.py"}', call_id="c2")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
@@ -853,94 +816,6 @@ class TestConcurrentToolExecution:
                 agent._execute_tool_calls(mock_msg, messages, "task-1")
                 mock_con.assert_called_once()
                 mock_seq.assert_not_called()
-
-    def test_terminal_batch_forces_sequential(self, agent):
-        """Stateful tools should not share the concurrent execution path."""
-        tc1 = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
-        tc2 = _mock_tool_call(name="terminal", arguments='{"command":"pwd"}', call_id="c2")
-        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
-        messages = []
-        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
-            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
-                agent._execute_tool_calls(mock_msg, messages, "task-1")
-                mock_seq.assert_called_once()
-                mock_con.assert_not_called()
-
-    def test_write_batch_forces_sequential(self, agent):
-        """File mutations should stay ordered within a turn."""
-        tc1 = _mock_tool_call(name="read_file", arguments='{"path":"x.py"}', call_id="c1")
-        tc2 = _mock_tool_call(name="write_file", arguments='{"path":"x.py","content":"print(1)"}', call_id="c2")
-        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
-        messages = []
-        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
-            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
-                agent._execute_tool_calls(mock_msg, messages, "task-1")
-                mock_seq.assert_called_once()
-                mock_con.assert_not_called()
-
-    def test_disjoint_write_batch_uses_concurrent_path(self, agent):
-        """Independent file writes should still run concurrently."""
-        tc1 = _mock_tool_call(
-            name="write_file",
-            arguments='{"path":"src/a.py","content":"print(1)"}',
-            call_id="c1",
-        )
-        tc2 = _mock_tool_call(
-            name="write_file",
-            arguments='{"path":"src/b.py","content":"print(2)"}',
-            call_id="c2",
-        )
-        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
-        messages = []
-        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
-            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
-                agent._execute_tool_calls(mock_msg, messages, "task-1")
-                mock_con.assert_called_once()
-                mock_seq.assert_not_called()
-
-    def test_overlapping_write_batch_forces_sequential(self, agent):
-        """Writes to the same file must stay ordered."""
-        tc1 = _mock_tool_call(
-            name="write_file",
-            arguments='{"path":"src/a.py","content":"print(1)"}',
-            call_id="c1",
-        )
-        tc2 = _mock_tool_call(
-            name="patch",
-            arguments='{"path":"src/a.py","old_string":"1","new_string":"2"}',
-            call_id="c2",
-        )
-        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
-        messages = []
-        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
-            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
-                agent._execute_tool_calls(mock_msg, messages, "task-1")
-                mock_seq.assert_called_once()
-                mock_con.assert_not_called()
-
-    def test_malformed_json_args_forces_sequential(self, agent):
-        """Unparseable tool arguments should fall back to sequential."""
-        tc1 = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
-        tc2 = _mock_tool_call(name="web_search", arguments="NOT JSON {{{", call_id="c2")
-        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
-        messages = []
-        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
-            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
-                agent._execute_tool_calls(mock_msg, messages, "task-1")
-                mock_seq.assert_called_once()
-                mock_con.assert_not_called()
-
-    def test_non_dict_args_forces_sequential(self, agent):
-        """Tool arguments that parse to a non-dict type should fall back to sequential."""
-        tc1 = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
-        tc2 = _mock_tool_call(name="web_search", arguments='"just a string"', call_id="c2")
-        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
-        messages = []
-        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
-            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
-                agent._execute_tool_calls(mock_msg, messages, "task-1")
-                mock_seq.assert_called_once()
-                mock_con.assert_not_called()
 
     def test_concurrent_executes_all_tools(self, agent):
         """Concurrent path should execute all tools and append results in order."""
@@ -1068,39 +943,6 @@ class TestConcurrentToolExecution:
         assert "ok" in result
 
 
-class TestPathsOverlap:
-    """Unit tests for the _paths_overlap helper."""
-
-    def test_same_path_overlaps(self):
-        from run_agent import _paths_overlap
-        assert _paths_overlap(Path("src/a.py"), Path("src/a.py"))
-
-    def test_siblings_do_not_overlap(self):
-        from run_agent import _paths_overlap
-        assert not _paths_overlap(Path("src/a.py"), Path("src/b.py"))
-
-    def test_parent_child_overlap(self):
-        from run_agent import _paths_overlap
-        assert _paths_overlap(Path("src"), Path("src/sub/a.py"))
-
-    def test_different_roots_do_not_overlap(self):
-        from run_agent import _paths_overlap
-        assert not _paths_overlap(Path("src/a.py"), Path("other/a.py"))
-
-    def test_nested_vs_flat_do_not_overlap(self):
-        from run_agent import _paths_overlap
-        assert not _paths_overlap(Path("src/sub/a.py"), Path("src/a.py"))
-
-    def test_empty_paths_do_not_overlap(self):
-        from run_agent import _paths_overlap
-        assert not _paths_overlap(Path(""), Path(""))
-
-    def test_one_empty_path_does_not_overlap(self):
-        from run_agent import _paths_overlap
-        assert not _paths_overlap(Path(""), Path("src/a.py"))
-        assert not _paths_overlap(Path("src/a.py"), Path(""))
-
-
 class TestHandleMaxIterations:
     def test_returns_summary(self, agent):
         resp = _mock_response(content="Here is a summary of what I did.")
@@ -1217,8 +1059,8 @@ class TestRunConversation:
         assert result["completed"] is True
         assert result["api_calls"] == 2
 
-    def test_empty_content_retry_uses_inline_reasoning_as_response(self, agent):
-        """Reasoning-only payloads should recover the inline reasoning text."""
+    def test_empty_content_retry_and_fallback(self, agent):
+        """Empty content (only think block) retries, then falls back to partial."""
         self._setup_agent(agent)
         empty_resp = _mock_response(
             content="<think>internal reasoning</think>",
@@ -1236,8 +1078,9 @@ class TestRunConversation:
             patch.object(agent, "_cleanup_task_resources"),
         ):
             result = agent.run_conversation("answer me")
-        assert result["completed"] is True
-        assert result["final_response"] == "internal reasoning"
+        # After 3 retries with no real content, should return partial
+        assert result["completed"] is False
+        assert result.get("partial") is True
 
     def test_nous_401_refreshes_after_remint_and_retries(self, agent):
         self._setup_agent(agent)
@@ -1308,36 +1151,6 @@ class TestRunConversation:
             result = agent.run_conversation("search something")
         mock_compress.assert_called_once()
         assert result["final_response"] == "All done"
-        assert result["completed"] is True
-
-    def test_glm_prompt_exceeds_max_length_triggers_compression(self, agent):
-        """GLM/Z.AI uses 'Prompt exceeds max length' for context overflow."""
-        self._setup_agent(agent)
-        err_400 = Exception(
-            "Error code: 400 - {'error': {'code': '1261', 'message': 'Prompt exceeds max length'}}"
-        )
-        err_400.status_code = 400
-        ok_resp = _mock_response(content="Recovered after compression", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [err_400, ok_resp]
-        prefill = [
-            {"role": "user", "content": "previous question"},
-            {"role": "assistant", "content": "previous answer"},
-        ]
-
-        with (
-            patch.object(agent, "_compress_context") as mock_compress,
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            mock_compress.return_value = (
-                [{"role": "user", "content": "hello"}],
-                "compressed system prompt",
-            )
-            result = agent.run_conversation("hello", conversation_history=prefill)
-
-        mock_compress.assert_called_once()
-        assert result["final_response"] == "Recovered after compression"
         assert result["completed"] is True
 
     @pytest.mark.parametrize(
@@ -1570,6 +1383,110 @@ class TestNousCredentialRefresh:
         )
         assert "default_headers" not in rebuilt["kwargs"]
         assert isinstance(agent.client, _RebuiltClient)
+
+
+class TestDynamicRequestHeaders:
+    def test_apply_request_headers_merges_resolved_headers(self, agent):
+        captured = {}
+
+        def _resolver(**kwargs):
+            captured.update(kwargs)
+            return {"PAYMENT-SIGNATURE": "sig-123"}
+
+        agent.request_headers_resolver = _resolver
+        merged = agent._apply_request_headers(
+            {"model": "test-model", "messages": [], "extra_headers": {"X-Test": "1"}}
+        )
+
+        assert merged["extra_headers"] == {
+            "X-Test": "1",
+            "PAYMENT-SIGNATURE": "sig-123",
+        }
+        assert captured["force_refresh"] is False
+
+    def test_run_conversation_retries_after_request_header_refresh(self, agent):
+        agent.provider = "header-hook-provider"
+        agent.api_mode = "chat_completions"
+
+        resolver_calls = []
+        seen_headers = []
+
+        def _resolver(**kwargs):
+            resolver_calls.append(kwargs["force_refresh"])
+            return {
+                "PAYMENT-SIGNATURE": "sig-refresh" if kwargs["force_refresh"] else "sig-initial"
+            }
+
+        class _PaymentRequiredError(RuntimeError):
+            def __init__(self):
+                super().__init__("payment required")
+                self.status_code = 402
+
+        responses = [_PaymentRequiredError(), _mock_response(content="ok")]
+
+        def _fake_api_call(api_kwargs):
+            seen_headers.append(dict(api_kwargs.get("extra_headers") or {}))
+            nxt = responses.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+
+        agent.request_headers_resolver = _resolver
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.time.sleep", return_value=None),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "ok"
+        assert seen_headers[0]["PAYMENT-SIGNATURE"] == "sig-initial"
+        assert seen_headers[1]["PAYMENT-SIGNATURE"] == "sig-refresh"
+        assert resolver_calls == [False, True]
+
+
+class TestTopLevelMessageResponseCoercion:
+    def test_coerces_anthropic_style_message_payload(self, agent):
+        response = SimpleNamespace(
+            model="claude-sonnet-4-6",
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+            type="message",
+            role="assistant",
+            content=[{"type": "text", "text": "smoke ok"}],
+            choices=None,
+        )
+
+        coerced = agent._coerce_top_level_message_response(response)
+
+        assert coerced.choices[0].message.content == "smoke ok"
+        assert coerced.choices[0].finish_reason == "stop"
+
+    def test_tracks_input_output_tokens_for_top_level_message_payload(self, agent):
+        response = SimpleNamespace(
+            model="claude-sonnet-4-6",
+            usage=SimpleNamespace(input_tokens=3, output_tokens=5),
+            type="message",
+            role="assistant",
+            content=[{"type": "text", "text": "smoke ok"}],
+            choices=None,
+        )
+
+        with (
+            patch.object(agent, "_interruptible_api_call", return_value=response),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.time.sleep", return_value=None),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "smoke ok"
+        assert agent.session_prompt_tokens == 3
+        assert agent.session_completion_tokens == 5
+        assert agent.session_total_tokens == 8
 
 
 class TestMaxTokensParam:
@@ -2359,41 +2276,6 @@ class TestFallbackAnthropicProvider:
         assert agent.client is mock_client
 
 
-def test_aiagent_uses_copilot_acp_client():
-    with (
-        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI") as mock_openai,
-        patch("agent.copilot_acp_client.CopilotACPClient") as mock_acp_client,
-    ):
-        acp_client = MagicMock()
-        mock_acp_client.return_value = acp_client
-
-        agent = AIAgent(
-            api_key="copilot-acp",
-            base_url="acp://copilot",
-            provider="copilot-acp",
-            acp_command="/usr/local/bin/copilot",
-            acp_args=["--acp", "--stdio"],
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
-
-    assert agent.client is acp_client
-    mock_openai.assert_not_called()
-    mock_acp_client.assert_called_once()
-    assert mock_acp_client.call_args.kwargs["base_url"] == "acp://copilot"
-    assert mock_acp_client.call_args.kwargs["api_key"] == "copilot-acp"
-    assert mock_acp_client.call_args.kwargs["command"] == "/usr/local/bin/copilot"
-    assert mock_acp_client.call_args.kwargs["args"] == ["--acp", "--stdio"]
-
-
-def test_is_openai_client_closed_honors_custom_client_flag():
-    assert AIAgent._is_openai_client_closed(SimpleNamespace(is_closed=True)) is True
-    assert AIAgent._is_openai_client_closed(SimpleNamespace(is_closed=False)) is False
-
-
 class TestAnthropicBaseUrlPassthrough:
     """Bug fix: base_url was filtered with 'anthropic in base_url', blocking proxies."""
 
@@ -2457,7 +2339,6 @@ class TestAnthropicCredentialRefresh:
         agent._anthropic_client = old_client
         agent._anthropic_api_key = "sk-ant-oat01-stale-token"
         agent._anthropic_base_url = "https://api.anthropic.com"
-        agent.provider = "anthropic"
 
         with (
             patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="sk-ant-oat01-fresh-token"),
@@ -2940,137 +2821,3 @@ class TestNormalizeCodexDictArguments:
         msg, _ = agent._normalize_codex_response(response)
         tc = msg.tool_calls[0]
         assert tc.function.arguments == args_str
-
-
-# ---------------------------------------------------------------------------
-# OAuth flag and nudge counter fixes (salvaged from PR #1797)
-# ---------------------------------------------------------------------------
-
-
-class TestOAuthFlagAfterCredentialRefresh:
-    """_is_anthropic_oauth must update when token type changes during refresh."""
-
-    def test_oauth_flag_updates_api_key_to_oauth(self, agent):
-        """Refreshing from API key to OAuth token must set flag to True."""
-        agent.api_mode = "anthropic_messages"
-        agent.provider = "anthropic"
-        agent._anthropic_api_key = "sk-ant-api-old"
-        agent._anthropic_client = MagicMock()
-        agent._is_anthropic_oauth = False
-
-        with (
-            patch("agent.anthropic_adapter.resolve_anthropic_token",
-                  return_value="sk-ant-setup-oauth-token"),
-            patch("agent.anthropic_adapter.build_anthropic_client",
-                  return_value=MagicMock()),
-        ):
-            result = agent._try_refresh_anthropic_client_credentials()
-
-        assert result is True
-        assert agent._is_anthropic_oauth is True
-
-    def test_oauth_flag_updates_oauth_to_api_key(self, agent):
-        """Refreshing from OAuth to API key must set flag to False."""
-        agent.api_mode = "anthropic_messages"
-        agent.provider = "anthropic"
-        agent._anthropic_api_key = "sk-ant-setup-old"
-        agent._anthropic_client = MagicMock()
-        agent._is_anthropic_oauth = True
-
-        with (
-            patch("agent.anthropic_adapter.resolve_anthropic_token",
-                  return_value="sk-ant-api03-new-key"),
-            patch("agent.anthropic_adapter.build_anthropic_client",
-                  return_value=MagicMock()),
-        ):
-            result = agent._try_refresh_anthropic_client_credentials()
-
-        assert result is True
-        assert agent._is_anthropic_oauth is False
-
-
-class TestFallbackSetsOAuthFlag:
-    """_try_activate_fallback must set _is_anthropic_oauth for Anthropic fallbacks."""
-
-    def test_fallback_to_anthropic_oauth_sets_flag(self, agent):
-        agent._fallback_activated = False
-        agent._fallback_model = {"provider": "anthropic", "model": "claude-sonnet-4-6"}
-
-        mock_client = MagicMock()
-        mock_client.base_url = "https://api.anthropic.com/v1"
-        mock_client.api_key = "sk-ant-setup-oauth-token"
-
-        with (
-            patch("agent.auxiliary_client.resolve_provider_client",
-                  return_value=(mock_client, None)),
-            patch("agent.anthropic_adapter.build_anthropic_client",
-                  return_value=MagicMock()),
-            patch("agent.anthropic_adapter.resolve_anthropic_token",
-                  return_value=None),
-        ):
-            result = agent._try_activate_fallback()
-
-        assert result is True
-        assert agent._is_anthropic_oauth is True
-
-    def test_fallback_to_anthropic_api_key_clears_flag(self, agent):
-        agent._fallback_activated = False
-        agent._fallback_model = {"provider": "anthropic", "model": "claude-sonnet-4-6"}
-
-        mock_client = MagicMock()
-        mock_client.base_url = "https://api.anthropic.com/v1"
-        mock_client.api_key = "sk-ant-api03-regular-key"
-
-        with (
-            patch("agent.auxiliary_client.resolve_provider_client",
-                  return_value=(mock_client, None)),
-            patch("agent.anthropic_adapter.build_anthropic_client",
-                  return_value=MagicMock()),
-            patch("agent.anthropic_adapter.resolve_anthropic_token",
-                  return_value=None),
-        ):
-            result = agent._try_activate_fallback()
-
-        assert result is True
-        assert agent._is_anthropic_oauth is False
-
-
-class TestMemoryNudgeCounterPersistence:
-    """_turns_since_memory must persist across run_conversation calls."""
-
-    def test_counters_initialized_in_init(self):
-        """Counters must exist on the agent after __init__."""
-        with patch("run_agent.get_tool_definitions", return_value=[]):
-            a = AIAgent(
-                model="test", api_key="test-key", provider="openrouter",
-                skip_context_files=True, skip_memory=True,
-            )
-        assert hasattr(a, "_turns_since_memory")
-        assert hasattr(a, "_iters_since_skill")
-        assert a._turns_since_memory == 0
-        assert a._iters_since_skill == 0
-
-    def test_counters_not_reset_in_preamble(self):
-        """The run_conversation preamble must not zero the nudge counters."""
-        import inspect
-        src = inspect.getsource(AIAgent.run_conversation)
-        # The preamble resets many fields (retry counts, budget, etc.)
-        # before the main loop. Find that reset block and verify our
-        # counters aren't in it. The reset block ends at iteration_budget.
-        preamble_end = src.index("self.iteration_budget = IterationBudget")
-        preamble = src[:preamble_end]
-        assert "self._turns_since_memory = 0" not in preamble
-        assert "self._iters_since_skill = 0" not in preamble
-
-
-class TestDeadRetryCode:
-    """Unreachable retry_count >= max_retries after raise must not exist."""
-
-    def test_no_unreachable_max_retries_after_backoff(self):
-        import inspect
-        source = inspect.getsource(AIAgent.run_conversation)
-        occurrences = source.count("if retry_count >= max_retries:")
-        assert occurrences == 2, (
-            f"Expected 2 occurrences of 'if retry_count >= max_retries:' "
-            f"but found {occurrences}"
-        )

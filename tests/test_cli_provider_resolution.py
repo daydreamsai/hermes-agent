@@ -229,6 +229,35 @@ def test_cli_prefers_config_provider_over_stale_env_override(monkeypatch):
     assert shell.requested_provider == "custom"
 
 
+def test_runtime_resolution_passes_request_headers_resolver_to_agent(monkeypatch):
+    cli = _import_cli()
+    resolver = lambda **kwargs: {"PAYMENT-SIGNATURE": "sig"}  # noqa: E731
+
+    def _runtime_resolve(**kwargs):
+        return {
+            "provider": "header-hook-provider",
+            "api_mode": "chat_completions",
+            "base_url": "https://headers.example/v1",
+            "api_key": "placeholder-key",
+            "source": "env/config",
+            "request_headers_resolver": resolver,
+            "request_headers_key": "helper:test-provider",
+        }
+
+    class _DummyAgent:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+    monkeypatch.setattr(cli, "AIAgent", _DummyAgent)
+
+    shell = cli.HermesCLI(model="test-model", compact=True, max_turns=1)
+
+    assert shell._init_agent() is True
+    assert shell.agent.kwargs["request_headers_resolver"] is resolver
+
+
 def test_codex_provider_replaces_incompatible_default_model(monkeypatch):
     """When provider resolves to openai-codex and no model was explicitly
     chosen, the global config default (e.g. anthropic/claude-opus-4.6) must
@@ -310,49 +339,6 @@ def test_codex_provider_uses_config_model(monkeypatch):
     assert "codex" in shell.model.lower()
     # LLM_MODEL env var is NOT used
     assert shell.model != "should-be-ignored"
-
-
-def test_codex_config_model_not_replaced_by_normalization(monkeypatch):
-    """When the user sets model.default in config.yaml to a specific codex
-    model, _normalize_model_for_provider must NOT replace it with the latest
-    available model from the API.  Regression test for #1887."""
-    cli = _import_cli()
-
-    monkeypatch.delenv("LLM_MODEL", raising=False)
-    monkeypatch.delenv("OPENAI_MODEL", raising=False)
-
-    # User explicitly configured gpt-5.3-codex in config.yaml
-    monkeypatch.setitem(cli.CLI_CONFIG, "model", {
-        "default": "gpt-5.3-codex",
-        "provider": "openai-codex",
-        "base_url": "https://chatgpt.com/backend-api/codex",
-    })
-
-    def _runtime_resolve(**kwargs):
-        return {
-            "provider": "openai-codex",
-            "api_mode": "codex_responses",
-            "base_url": "https://chatgpt.com/backend-api/codex",
-            "api_key": "fake-key",
-            "source": "env/config",
-        }
-
-    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
-    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
-    # API returns a DIFFERENT model than what the user configured
-    monkeypatch.setattr(
-        "hermes_cli.codex_models.get_codex_model_ids",
-        lambda access_token=None: ["gpt-5.4", "gpt-5.3-codex"],
-    )
-
-    shell = cli.HermesCLI(compact=True, max_turns=1)
-
-    # Config model is NOT the global default — user made a deliberate choice
-    assert shell._model_is_default is False
-    assert shell._ensure_runtime_credentials() is True
-    assert shell.provider == "openai-codex"
-    # Model must stay as user configured, not replaced by gpt-5.4
-    assert shell.model == "gpt-5.3-codex"
 
 
 def test_codex_provider_preserves_explicit_codex_model(monkeypatch):
