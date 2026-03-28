@@ -20,7 +20,7 @@ the steps below.
 
 | Component | Value |
 |-----------|-------|
-| **Library** | `@slack/bolt` (Socket Mode) |
+| **Library** | `slack-bolt` / `slack_sdk` for Python (Socket Mode) |
 | **Connection** | WebSocket — no public URL required |
 | **Auth tokens needed** | Bot Token (`xoxb-`) + App-Level Token (`xapp-`) |
 | **User identification** | Slack Member IDs (e.g., `U01ABC2DEF3`) |
@@ -91,6 +91,7 @@ You can always find or regenerate app-level tokens under **Settings → Basic In
 
 This step is critical — it controls what messages the bot can see.
 
+
 1. In the sidebar, go to **Features → Event Subscriptions**
 2. Toggle **Enable Events** to ON
 3. Expand **Subscribe to bot events** and add:
@@ -109,6 +110,7 @@ If the bot works in DMs but **not in channels**, you almost certainly forgot to 
 `message.channels` (for public channels) and/or `message.groups` (for private channels).
 Without these events, Slack simply never delivers channel messages to the bot.
 :::
+
 
 ---
 
@@ -154,6 +156,7 @@ SLACK_ALLOWED_USERS=U01ABC2DEF3              # Comma-separated Member IDs
 
 # Optional
 SLACK_HOME_CHANNEL=C01234567890              # Default channel for cron/scheduled messages
+SLACK_HOME_CHANNEL_NAME=general              # Human-readable name for the home channel (optional)
 ```
 
 Or run the interactive setup:
@@ -166,7 +169,8 @@ Then start the gateway:
 
 ```bash
 hermes gateway              # Foreground
-hermes gateway install      # Install as a system service
+hermes gateway install      # Install as a user service
+sudo hermes gateway install --system   # Linux only: boot-time system service
 ```
 
 ---
@@ -190,8 +194,8 @@ Understanding how Hermes behaves in different contexts:
 | Context | Behavior |
 |---------|----------|
 | **DMs** | Bot responds to every message — no @mention needed |
-| **Channels** | Bot **only responds when @mentioned** (e.g., `@Hermes Agent what time is it?`) |
-| **Threads** | Bot replies in threads when the triggering message is in a thread |
+| **Channels** | Bot **only responds when @mentioned** (e.g., `@Hermes Agent what time is it?`). In channels, Hermes replies in a thread attached to that message. |
+| **Threads** | If you @mention Hermes inside an existing thread, it replies in that same thread. |
 
 :::tip
 In channels, always @mention the bot. Simply typing a message without mentioning it will be ignored.
@@ -199,6 +203,7 @@ This is intentional — it prevents the bot from responding to every message in 
 :::
 
 ---
+
 
 ## Home Channel
 
@@ -221,7 +226,7 @@ Make sure the bot has been **invited to the channel** (`/invite @Hermes Agent`).
 
 Hermes supports voice on Slack:
 
-- **Incoming:** Voice/audio messages are automatically transcribed using Whisper (requires `VOICE_TOOLS_OPENAI_KEY`)
+- **Incoming:** Voice/audio messages are automatically transcribed using the configured STT provider: local `faster-whisper`, Groq Whisper (`GROQ_API_KEY`), or OpenAI Whisper (`VOICE_TOOLS_OPENAI_KEY`)
 - **Outgoing:** TTS responses are sent as audio file attachments
 
 ---

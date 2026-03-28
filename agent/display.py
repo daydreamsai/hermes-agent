@@ -59,6 +59,32 @@ def get_skin_tool_prefix() -> str:
     return "┊"
 
 
+def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
+    """Get the display emoji for a tool.
+
+    Resolution order:
+    1. Active skin's ``tool_emojis`` overrides (if a skin is loaded)
+    2. Tool registry's per-tool ``emoji`` field
+    3. *default* fallback
+    """
+    # 1. Skin override
+    skin = _get_skin()
+    if skin and skin.tool_emojis:
+        override = skin.tool_emojis.get(tool_name)
+        if override:
+            return override
+    # 2. Registry default
+    try:
+        from tools.registry import registry
+        emoji = registry.get_emoji(tool_name, default="")
+        if emoji:
+            return emoji
+    except Exception:
+        pass
+    # 3. Hardcoded fallback
+    return default
+
+
 # =========================================================================
 # Tool preview (one-line summary of a tool call's primary argument)
 # =========================================================================
@@ -68,7 +94,7 @@ def _oneline(text: str) -> str:
     return " ".join(text.split())
 
 
-def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str:
+def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str | None:
     """Build a short preview of a tool call's primary argument for display."""
     if not args:
         return None
@@ -80,7 +106,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str:
         "image_generate": "prompt", "text_to_speech": "text",
         "vision_analyze": "question", "mixture_of_agents": "user_prompt",
         "skill_view": "name", "skills_list": "category",
-        "schedule_cronjob": "name",
+        "cronjob": "action",
         "execute_code": "code", "delegate_task": "goal",
         "clarify": "question", "skill_manage": "name",
     }
@@ -205,7 +231,7 @@ class KawaiiSpinner:
         "analyzing", "computing", "synthesizing", "formulating", "brainstorming",
     ]
 
-    def __init__(self, message: str = "", spinner_type: str = 'dots'):
+    def __init__(self, message: str = "", spinner_type: str = 'dots', print_fn=None):
         self.message = message
         self.spinner_frames = self.SPINNERS.get(spinner_type, self.SPINNERS['dots'])
         self.running = False
@@ -213,13 +239,26 @@ class KawaiiSpinner:
         self.frame_idx = 0
         self.start_time = None
         self.last_line_len = 0
-        self._last_flush_time = 0.0  # Rate-limit flushes for patch_stdout compat
+        # Optional callable to route all output through (e.g. a no-op for silent
+        # background agents).  When set, bypasses self._out entirely so that
+        # agents with _print_fn overridden remain fully silent.
+        self._print_fn = print_fn
         # Capture stdout NOW, before any redirect_stdout(devnull) from
         # child agents can replace sys.stdout with a black hole.
         self._out = sys.stdout
 
     def _write(self, text: str, end: str = '\n', flush: bool = False):
-        """Write to the stdout captured at spinner creation time."""
+        """Write to the stdout captured at spinner creation time.
+
+        If a print_fn was supplied at construction, all output is routed through
+        it instead — allowing callers to silence the spinner with a no-op lambda.
+        """
+        if self._print_fn is not None:
+            try:
+                self._print_fn(text)
+            except Exception:
+                pass
+            return
         try:
             self._out.write(text + end)
             if flush:
@@ -227,7 +266,50 @@ class KawaiiSpinner:
         except (ValueError, OSError):
             pass
 
+    @property
+    def _is_tty(self) -> bool:
+        """Check if output is a real terminal, safe against closed streams."""
+        try:
+            return hasattr(self._out, 'isatty') and self._out.isatty()
+        except (ValueError, OSError):
+            return False
+
+    def _is_patch_stdout_proxy(self) -> bool:
+        """Return True when stdout is prompt_toolkit's StdoutProxy.
+
+        patch_stdout wraps sys.stdout in a StdoutProxy that queues writes and
+        injects newlines around each flush().  The \\r overwrite never lands on
+        the correct line — each spinner frame ends up on its own line.
+
+        The CLI already drives a TUI widget (_spinner_text) for spinner display,
+        so KawaiiSpinner's \\r-based animation is redundant under StdoutProxy.
+        """
+        out = self._out
+        # StdoutProxy has a 'raw' attribute (bool) that plain file objects lack.
+        if hasattr(out, 'raw') and type(out).__name__ == 'StdoutProxy':
+            return True
+        return False
+
     def _animate(self):
+        # When stdout is not a real terminal (e.g. Docker, systemd, pipe),
+        # skip the animation entirely — it creates massive log bloat.
+        # Just log the start once and let stop() log the completion.
+        if not self._is_tty:
+            self._write(f"  [tool] {self.message}", flush=True)
+            while self.running:
+                time.sleep(0.5)
+            return
+
+        # When running inside prompt_toolkit's patch_stdout context the CLI
+        # renders spinner state via a dedicated TUI widget (_spinner_text).
+        # Driving a \r-based animation here too causes visual overdraw: the
+        # StdoutProxy injects newlines around each flush, so every frame lands
+        # on a new line and overwrites the status bar.
+        if self._is_patch_stdout_proxy():
+            while self.running:
+                time.sleep(0.1)
+            return
+
         # Cache skin wings at start (avoid per-frame imports)
         skin = _get_skin()
         wings = skin.get_spinner_wings() if skin else []
@@ -244,18 +326,7 @@ class KawaiiSpinner:
             else:
                 line = f"  {frame} {self.message} ({elapsed:.1f}s)"
             pad = max(self.last_line_len - len(line), 0)
-            # Rate-limit flush() calls to avoid spinner spam under
-            # prompt_toolkit's patch_stdout.  Each flush() pushes a queue
-            # item that may trigger a separate run_in_terminal() call; if
-            # items are processed one-at-a-time the \r overwrite is lost
-            # and every frame appears on its own line.  By flushing at
-            # most every 0.4s we guarantee multiple \r-frames are batched
-            # into a single write, so the terminal collapses them correctly.
-            now = time.time()
-            should_flush = (now - self._last_flush_time) >= 0.4
-            self._write(f"\r{line}{' ' * pad}", end='', flush=should_flush)
-            if should_flush:
-                self._last_flush_time = now
+            self._write(f"\r{line}{' ' * pad}", end='', flush=True)
             self.last_line_len = len(line)
             self.frame_idx += 1
             time.sleep(0.12)
@@ -293,12 +364,19 @@ class KawaiiSpinner:
         self.running = False
         if self.thread:
             self.thread.join(timeout=0.5)
-        # Clear the spinner line with spaces instead of \033[K to avoid
-        # garbled escape codes when prompt_toolkit's patch_stdout is active.
-        blanks = ' ' * max(self.last_line_len + 5, 40)
-        self._write(f"\r{blanks}\r", end='', flush=True)
+
+        is_tty = self._is_tty
+        if is_tty:
+            # Clear the spinner line with spaces instead of \033[K to avoid
+            # garbled escape codes when prompt_toolkit's patch_stdout is active.
+            blanks = ' ' * max(self.last_line_len + 5, 40)
+            self._write(f"\r{blanks}\r", end='', flush=True)
         if final_message:
-            self._write(f"  {final_message}", flush=True)
+            elapsed = f" ({time.time() - self.start_time:.1f}s)" if self.start_time else ""
+            if is_tty:
+                self._write(f"  {final_message}", flush=True)
+            else:
+                self._write(f"  [done] {final_message}{elapsed}", flush=True)
 
     def __enter__(self):
         self.start()
@@ -513,12 +591,15 @@ def get_cute_tool_message(
         return _wrap(f"┊ 🧠 reason    {_trunc(args.get('user_prompt', ''), 30)}  {dur}")
     if tool_name == "send_message":
         return _wrap(f"┊ 📨 send      {args.get('target', '?')}: \"{_trunc(args.get('message', ''), 25)}\"  {dur}")
-    if tool_name == "schedule_cronjob":
-        return _wrap(f"┊ ⏰ schedule  {_trunc(args.get('name', args.get('prompt', 'task')), 30)}  {dur}")
-    if tool_name == "list_cronjobs":
-        return _wrap(f"┊ ⏰ jobs      listing  {dur}")
-    if tool_name == "remove_cronjob":
-        return _wrap(f"┊ ⏰ remove    job {args.get('job_id', '?')}  {dur}")
+    if tool_name == "cronjob":
+        action = args.get("action", "?")
+        if action == "create":
+            skills = args.get("skills") or ([] if not args.get("skill") else [args.get("skill")])
+            label = args.get("name") or (skills[0] if skills else None) or args.get("prompt", "task")
+            return _wrap(f"┊ ⏰ cron      create {_trunc(label, 24)}  {dur}")
+        if action == "list":
+            return _wrap(f"┊ ⏰ cron      listing  {dur}")
+        return _wrap(f"┊ ⏰ cron      {action} {args.get('job_id', '')}  {dur}")
     if tool_name.startswith("rl_"):
         rl = {
             "rl_list_environments": "list envs", "rl_select_environment": f"select {args.get('name', '')}",
@@ -540,3 +621,124 @@ def get_cute_tool_message(
 
     preview = build_tool_preview(tool_name, args) or ""
     return _wrap(f"┊ ⚡ {tool_name[:9]:9} {_trunc(preview, 35)}  {dur}")
+
+
+# =========================================================================
+# Honcho session line (one-liner with clickable OSC 8 hyperlink)
+# =========================================================================
+
+_DIM = "\033[2m"
+_SKY_BLUE = "\033[38;5;117m"
+_ANSI_RESET = "\033[0m"
+
+
+def honcho_session_url(workspace: str, session_name: str) -> str:
+    """Build a Honcho app URL for a session."""
+    from urllib.parse import quote
+    return (
+        f"https://app.honcho.dev/explore"
+        f"?workspace={quote(workspace, safe='')}"
+        f"&view=sessions"
+        f"&session={quote(session_name, safe='')}"
+    )
+
+
+def _osc8_link(url: str, text: str) -> str:
+    """OSC 8 terminal hyperlink (clickable in iTerm2, Ghostty, WezTerm, etc.)."""
+    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
+
+
+def honcho_session_line(workspace: str, session_name: str) -> str:
+    """One-line session indicator: `Honcho session: <clickable name>`."""
+    url = honcho_session_url(workspace, session_name)
+    linked_name = _osc8_link(url, f"{_SKY_BLUE}{session_name}{_ANSI_RESET}")
+    return f"{_DIM}Honcho session:{_ANSI_RESET} {linked_name}"
+
+
+def write_tty(text: str) -> None:
+    """Write directly to /dev/tty, bypassing stdout capture."""
+    try:
+        fd = os.open("/dev/tty", os.O_WRONLY)
+        os.write(fd, text.encode("utf-8"))
+        os.close(fd)
+    except OSError:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+
+# =========================================================================
+# Context pressure display (CLI user-facing warnings)
+# =========================================================================
+
+# ANSI color codes for context pressure tiers
+_CYAN = "\033[36m"
+_YELLOW = "\033[33m"
+_BOLD = "\033[1m"
+_DIM_ANSI = "\033[2m"
+
+# Bar characters
+_BAR_FILLED = "▰"
+_BAR_EMPTY = "▱"
+_BAR_WIDTH = 20
+
+
+def format_context_pressure(
+    compaction_progress: float,
+    threshold_tokens: int,
+    threshold_percent: float,
+    compression_enabled: bool = True,
+) -> str:
+    """Build a formatted context pressure line for CLI display.
+
+    The bar and percentage show progress toward the compaction threshold,
+    NOT the raw context window.  100% = compaction fires.
+
+    Args:
+        compaction_progress: How close to compaction (0.0–1.0, 1.0 = fires).
+        threshold_tokens: Compaction threshold in tokens.
+        threshold_percent: Compaction threshold as a fraction of context window.
+        compression_enabled: Whether auto-compression is active.
+    """
+    pct_int = min(int(compaction_progress * 100), 100)
+    filled = min(int(compaction_progress * _BAR_WIDTH), _BAR_WIDTH)
+    bar = _BAR_FILLED * filled + _BAR_EMPTY * (_BAR_WIDTH - filled)
+
+    threshold_k = f"{threshold_tokens // 1000}k" if threshold_tokens >= 1000 else str(threshold_tokens)
+    threshold_pct_int = int(threshold_percent * 100)
+
+    color = f"{_BOLD}{_YELLOW}"
+    icon = "⚠"
+    if compression_enabled:
+        hint = "compaction approaching"
+    else:
+        hint = "no auto-compaction"
+
+    return (
+        f"  {color}{icon} context {bar} {pct_int}% to compaction{_ANSI_RESET}"
+        f"  {_DIM_ANSI}{threshold_k} threshold ({threshold_pct_int}%) · {hint}{_ANSI_RESET}"
+    )
+
+
+def format_context_pressure_gateway(
+    compaction_progress: float,
+    threshold_percent: float,
+    compression_enabled: bool = True,
+) -> str:
+    """Build a plain-text context pressure notification for messaging platforms.
+
+    No ANSI — just Unicode and plain text suitable for Telegram/Discord/etc.
+    The percentage shows progress toward the compaction threshold.
+    """
+    pct_int = min(int(compaction_progress * 100), 100)
+    filled = min(int(compaction_progress * _BAR_WIDTH), _BAR_WIDTH)
+    bar = _BAR_FILLED * filled + _BAR_EMPTY * (_BAR_WIDTH - filled)
+
+    threshold_pct_int = int(threshold_percent * 100)
+
+    icon = "⚠️"
+    if compression_enabled:
+        hint = f"Context compaction approaching (threshold: {threshold_pct_int}% of window)."
+    else:
+        hint = "Auto-compaction is disabled — context may be truncated."
+
+    return f"{icon} Context: {bar} {pct_int}% to compaction\n{hint}"
