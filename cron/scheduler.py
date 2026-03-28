@@ -386,6 +386,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 "api_mode": runtime.get("api_mode"),
                 "command": runtime.get("command"),
                 "args": list(runtime.get("args") or []),
+                "request_headers_resolver": runtime.get("request_headers_resolver"),
+                "payment_adapter": runtime.get("payment_adapter"),
+                "payment_config": runtime.get("payment_config"),
             },
         )
 
@@ -397,6 +400,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             api_mode=turn_route["runtime"].get("api_mode"),
             acp_command=turn_route["runtime"].get("command"),
             acp_args=turn_route["runtime"].get("args"),
+            request_headers_resolver=turn_route["runtime"].get("request_headers_resolver"),
+            payment_adapter=turn_route["runtime"].get("payment_adapter"),
+            payment_config=turn_route["runtime"].get("payment_config"),
             max_iterations=max_iterations,
             reasoning_config=reasoning_config,
             prefill_messages=prefill_messages,

@@ -127,6 +127,9 @@ def resolve_turn_route(user_message: str, routing_config: Optional[Dict[str, Any
                 "api_mode": primary.get("api_mode"),
                 "command": primary.get("command"),
                 "args": list(primary.get("args") or []),
+                "request_headers_resolver": primary.get("request_headers_resolver"),
+                "payment_adapter": primary.get("payment_adapter"),
+                "payment_config": primary.get("payment_config"),
             },
             "label": None,
             "signature": (
@@ -162,6 +165,9 @@ def resolve_turn_route(user_message: str, routing_config: Optional[Dict[str, Any
                 "api_mode": primary.get("api_mode"),
                 "command": primary.get("command"),
                 "args": list(primary.get("args") or []),
+                "request_headers_resolver": primary.get("request_headers_resolver"),
+                "payment_adapter": primary.get("payment_adapter"),
+                "payment_config": primary.get("payment_config"),
             },
             "label": None,
             "signature": (
@@ -183,6 +189,9 @@ def resolve_turn_route(user_message: str, routing_config: Optional[Dict[str, Any
             "api_mode": runtime.get("api_mode"),
             "command": runtime.get("command"),
             "args": list(runtime.get("args") or []),
+            "request_headers_resolver": runtime.get("request_headers_resolver"),
+            "payment_adapter": runtime.get("payment_adapter"),
+            "payment_config": runtime.get("payment_config"),
         },
         "label": f"smart route → {route.get('model')} ({runtime.get('provider')})",
         "signature": (

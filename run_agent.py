@@ -100,6 +100,9 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.payments.mpp_adapter import build_payment_adapter, build_payment_session_key
+from agent.payments.mpp_session import PaymentSessionStore
+from agent.payments.types import PaymentChallenge
 from utils import atomic_json_write
 
 HONCHO_TOOL_NAMES = {
@@ -388,6 +391,9 @@ class AIAgent:
         acp_args: list[str] | None = None,
         command: str = None,
         args: list[str] | None = None,
+        request_headers_resolver=None,
+        payment_adapter: str = None,
+        payment_config: Dict[str, Any] = None,
         model: str = "anthropic/claude-opus-4.6",  # OpenRouter format
         max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
         tool_delay: float = 1.0,
@@ -503,6 +509,11 @@ class AIAgent:
         self.provider = provider_name or "openrouter"
         self.acp_command = acp_command or command
         self.acp_args = list(acp_args or args or [])
+        self.request_headers_resolver = request_headers_resolver
+        self.payment_adapter = payment_adapter
+        self.payment_config = dict(payment_config) if isinstance(payment_config, dict) else payment_config
+        self._payment_session_store = PaymentSessionStore()
+        self._pending_payment_headers = None
         if api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
             self.api_mode = api_mode
         elif self.provider == "openai-codex":
@@ -4553,6 +4564,81 @@ class AIAgent:
 
         return api_kwargs
 
+    @staticmethod
+    def _merge_api_headers(api_kwargs: dict, headers: Optional[Dict[str, str]]) -> dict:
+        if not headers:
+            return api_kwargs
+        merged_kwargs = dict(api_kwargs)
+        extra_headers = dict(merged_kwargs.get("extra_headers") or {})
+        extra_headers.update(headers)
+        merged_kwargs["extra_headers"] = extra_headers
+        return merged_kwargs
+
+    def _build_payment_request_context(self, api_kwargs: dict, error: Exception = None) -> dict:
+        return {
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "model": self.model,
+            "api_kwargs": api_kwargs,
+            "error": error,
+            "payment_config": self.payment_config or {},
+        }
+
+    def _apply_payment_adapter(self, api_kwargs: dict, error: Exception = None, force_refresh: bool = False) -> dict:
+        adapter = build_payment_adapter(self.payment_adapter)
+        if adapter is None:
+            return api_kwargs
+
+        updated_kwargs = dict(api_kwargs)
+        if self._pending_payment_headers:
+            updated_kwargs = self._merge_api_headers(updated_kwargs, self._pending_payment_headers)
+            self._pending_payment_headers = None
+            if not force_refresh:
+                return updated_kwargs
+
+        runtime = {
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "payment_config": self.payment_config or {},
+        }
+        session_key = build_payment_session_key(runtime, self.model)
+        prior_session = self._payment_session_store.get(session_key)
+        if not force_refresh and prior_session is None:
+            return updated_kwargs
+
+        request_context = self._build_payment_request_context(updated_kwargs, error=error)
+        if force_refresh:
+            challenge = adapter.parse_challenge(error, request_context)
+        else:
+            challenge = PaymentChallenge(
+                adapter=adapter.adapter_name,
+                intent=str((self.payment_config or {}).get("intent") or "session"),
+                endpoint=str(self.base_url or ""),
+                method=str((self.payment_config or {}).get("method") or "unknown"),
+                raw={},
+            )
+
+        runtime_config = {
+            "payment_config": self.payment_config or {},
+        }
+        credential = adapter.build_credential(
+            challenge,
+            request_context,
+            None if force_refresh else prior_session,
+            runtime_config,
+        )
+        if credential.headers:
+            updated_kwargs = self._merge_api_headers(updated_kwargs, credential.headers)
+
+        if force_refresh:
+            updated_session = adapter.update_session(challenge, None, prior_session)
+            if updated_session is not None:
+                if credential.headers:
+                    updated_session.state["headers"] = dict(credential.headers)
+                self._payment_session_store.set(session_key, updated_session)
+
+        return updated_kwargs
+
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
 
@@ -6137,6 +6223,7 @@ class AIAgent:
                     api_kwargs = self._build_api_kwargs(api_messages)
                     if self.api_mode == "codex_responses":
                         api_kwargs = self._preflight_codex_api_kwargs(api_kwargs, allow_stream=False)
+                    api_kwargs = self._apply_payment_adapter(api_kwargs)
 
                     if os.getenv("HERMES_DUMP_REQUESTS", "").strip().lower() in {"1", "true", "yes", "on"}:
                         self._dump_api_request_debug(api_kwargs, reason="preflight")
@@ -6560,6 +6647,31 @@ class AIAgent:
                             hit_pct = (cached / prompt * 100) if prompt > 0 else 0
                             if not self.quiet_mode:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
+
+                    payment_runtime = {
+                        "provider": self.provider,
+                        "base_url": self.base_url,
+                        "payment_config": self.payment_config or {},
+                    }
+                    payment_session_key = build_payment_session_key(payment_runtime, self.model)
+                    payment_adapter = build_payment_adapter(self.payment_adapter)
+                    if payment_adapter is not None:
+                        prior_session = self._payment_session_store.get(payment_session_key)
+                        if prior_session is not None:
+                            receipt = payment_adapter.extract_receipt(response)
+                            updated_session = payment_adapter.update_session(
+                                PaymentChallenge(
+                                    adapter=payment_adapter.adapter_name,
+                                    intent=str((self.payment_config or {}).get("intent") or "session"),
+                                    endpoint=str(self.base_url or ""),
+                                    method=str((self.payment_config or {}).get("method") or "unknown"),
+                                    raw={"response": response},
+                                ),
+                                receipt,
+                                prior_session,
+                            )
+                            if updated_session is not None:
+                                self._payment_session_store.set(payment_session_key, updated_session)
                     
                     break  # Success, exit retry loop
 
@@ -6629,6 +6741,22 @@ class AIAgent:
                         print(f"{self.log_prefix}     • For Claude Code: run 'claude /login' to refresh, then retry")
                         print(f"{self.log_prefix}     • Clear stale keys: hermes config set ANTHROPIC_TOKEN \"\"")
                         print(f"{self.log_prefix}     • Legacy cleanup: hermes config set ANTHROPIC_API_KEY \"\"")
+                    if (
+                        self.api_mode == "chat_completions"
+                        and status_code == 402
+                        and self.payment_adapter == "mpp"
+                    ):
+                        refreshed_kwargs = self._apply_payment_adapter(
+                            api_kwargs,
+                            error=api_error,
+                            force_refresh=True,
+                        )
+                        refreshed_headers = dict(refreshed_kwargs.get("extra_headers") or {})
+                        if refreshed_headers:
+                            self._pending_payment_headers = refreshed_headers
+                            self._vprint(f"{self.log_prefix}💸 Payment challenge received. Retrying with MPP credentials...")
+                            retry_count += 1
+                            continue
 
                     retry_count += 1
                     elapsed_time = time.time() - api_start_time

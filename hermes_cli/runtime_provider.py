@@ -419,6 +419,10 @@ def resolve_runtime_provider(
             "base_url": base_url,
             "api_key": creds.get("api_key", ""),
             "source": creds.get("source", "env"),
+            "request_headers_resolver": creds.get("request_headers_resolver"),
+            "request_headers_key": creds.get("request_headers_key"),
+            "payment_adapter": creds.get("payment_adapter"),
+            "payment_config": creds.get("payment_config"),
             "requested_provider": requested_provider,
         }
 

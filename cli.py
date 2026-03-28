@@ -1114,6 +1114,10 @@ class HermesCLI:
         self.api_mode = "chat_completions"
         self.acp_command: Optional[str] = None
         self.acp_args: list[str] = []
+        self._request_headers_resolver = None
+        self._request_headers_key = None
+        self._payment_adapter = None
+        self._payment_config = None
         self.base_url = (
             base_url
             or os.getenv("OPENAI_BASE_URL")
@@ -1898,6 +1902,10 @@ class HermesCLI:
         resolved_api_mode = runtime.get("api_mode", self.api_mode)
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
+        resolved_request_headers_resolver = runtime.get("request_headers_resolver")
+        resolved_request_headers_key = runtime.get("request_headers_key")
+        resolved_payment_adapter = runtime.get("payment_adapter")
+        resolved_payment_config = runtime.get("payment_config")
         if not isinstance(api_key, str) or not api_key:
             # Custom / local endpoints (llama.cpp, ollama, vLLM, etc.) often
             # don't require authentication.  When a base_url IS configured but
@@ -1925,11 +1933,18 @@ class HermesCLI:
             or resolved_api_mode != self.api_mode
             or resolved_acp_command != self.acp_command
             or resolved_acp_args != self.acp_args
+            or resolved_request_headers_key != self._request_headers_key
+            or resolved_payment_adapter != self._payment_adapter
+            or resolved_payment_config != self._payment_config
         )
         self.provider = resolved_provider
         self.api_mode = resolved_api_mode
         self.acp_command = resolved_acp_command
         self.acp_args = resolved_acp_args
+        self._request_headers_resolver = resolved_request_headers_resolver
+        self._request_headers_key = resolved_request_headers_key
+        self._payment_adapter = resolved_payment_adapter
+        self._payment_config = resolved_payment_config
         self._provider_source = runtime.get("source")
         self.api_key = api_key
         self.base_url = base_url
@@ -1961,6 +1976,9 @@ class HermesCLI:
                 "api_mode": self.api_mode,
                 "command": self.acp_command,
                 "args": list(self.acp_args or []),
+                "request_headers_resolver": self._request_headers_resolver,
+                "payment_adapter": self._payment_adapter,
+                "payment_config": self._payment_config,
             },
         )
 
@@ -2031,6 +2049,9 @@ class HermesCLI:
                 "api_mode": self.api_mode,
                 "command": self.acp_command,
                 "args": list(self.acp_args or []),
+                "request_headers_resolver": self._request_headers_resolver,
+                "payment_adapter": self._payment_adapter,
+                "payment_config": self._payment_config,
             }
             effective_model = model_override or self.model
             self.agent = AIAgent(
@@ -2041,6 +2062,9 @@ class HermesCLI:
                 api_mode=runtime.get("api_mode"),
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
+                request_headers_resolver=runtime.get("request_headers_resolver"),
+                payment_adapter=runtime.get("payment_adapter"),
+                payment_config=runtime.get("payment_config"),
                 max_iterations=self.max_turns,
                 enabled_toolsets=self.enabled_toolsets,
                 verbose_logging=self.verbose,
@@ -4018,6 +4042,9 @@ class HermesCLI:
                     api_mode=turn_route["runtime"].get("api_mode"),
                     acp_command=turn_route["runtime"].get("command"),
                     acp_args=turn_route["runtime"].get("args"),
+                    request_headers_resolver=turn_route["runtime"].get("request_headers_resolver"),
+                    payment_adapter=turn_route["runtime"].get("payment_adapter"),
+                    payment_config=turn_route["runtime"].get("payment_config"),
                     max_iterations=self.max_turns,
                     enabled_toolsets=self.enabled_toolsets,
                     quiet_mode=True,

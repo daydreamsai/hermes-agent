@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import run_agent
+from agent.payments.types import PaymentSessionHandle
 from honcho_integration.client import HonchoClientConfig
 from run_agent import AIAgent, _inject_honcho_turn_context
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
@@ -1510,6 +1511,237 @@ class TestRetryExhaustion:
         assert result.get("failed") is True
         assert "error" in result
         assert "rate limited" in result["error"]
+
+
+class TestMPPPaymentAdapter:
+    def test_mpp_adapter_parses_challenge_headers_and_receipt(self):
+        challenge_response = SimpleNamespace(
+            status_code=402,
+            headers={
+                "X-MPP-Intent": "session",
+                "X-MPP-Method": "method-a",
+                "X-MPP-Session-Id": "sess-1",
+            },
+            json=lambda: {"challenge": "ok"},
+        )
+        success_response = SimpleNamespace(
+            headers={
+                "X-MPP-Receipt-Id": "rcpt-1",
+                "X-MPP-Session-Id": "sess-1",
+                "X-MPP-Receipt-Verified": "true",
+            },
+            json=lambda: {},
+        )
+
+        adapter = run_agent.build_payment_adapter("mpp")
+        challenge = adapter.parse_challenge(
+            challenge_response,
+            {
+                "base_url": "https://paid.example/v1",
+                "payment_config": {
+                    "method": "fallback-method",
+                    "credential_headers": {"X-MPP-AUTH": "session-token"},
+                },
+            },
+        )
+        receipt = adapter.extract_receipt(success_response)
+        session = adapter.update_session(challenge, receipt, None)
+
+        assert challenge.intent == "session"
+        assert challenge.method == "method-a"
+        assert receipt.receipt_id == "rcpt-1"
+        assert receipt.session_id == "sess-1"
+        assert receipt.verified is True
+        assert session.session_id == "sess-1"
+
+    def test_run_conversation_retries_after_mpp_402(self, agent):
+        agent.provider = "paid-provider"
+        agent.api_mode = "chat_completions"
+        agent.payment_adapter = "mpp"
+        agent.payment_config = {
+            "method": "test-method",
+            "credential_headers": {"X-MPP-AUTH": "session-token"},
+        }
+
+        seen_headers = []
+
+        class _PaymentRequiredError(RuntimeError):
+            def __init__(self):
+                super().__init__("payment required")
+                self.status_code = 402
+
+        responses = [_PaymentRequiredError(), _mock_response(content="ok")]
+
+        def _fake_api_call(api_kwargs):
+            seen_headers.append(dict(api_kwargs.get("extra_headers") or {}))
+            nxt = responses.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.time.sleep", return_value=None),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "ok"
+        assert seen_headers[0] == {}
+        assert seen_headers[1]["X-MPP-AUTH"] == "session-token"
+
+    def test_run_conversation_reuses_mpp_session_on_next_request(self, agent):
+        agent.provider = "paid-provider"
+        agent.api_mode = "chat_completions"
+        agent.payment_adapter = "mpp"
+        agent.payment_config = {
+            "method": "test-method",
+            "credential_headers": {"X-MPP-AUTH": "session-token"},
+        }
+
+        seen_headers = []
+
+        class _PaymentRequiredError(RuntimeError):
+            def __init__(self):
+                super().__init__("payment required")
+                self.status_code = 402
+
+        responses = [_PaymentRequiredError(), _mock_response(content="ok"), _mock_response(content="ok-2")]
+
+        def _fake_api_call(api_kwargs):
+            seen_headers.append(dict(api_kwargs.get("extra_headers") or {}))
+            nxt = responses.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.time.sleep", return_value=None),
+        ):
+            first = agent.run_conversation("hello")
+            second = agent.run_conversation("hello again")
+
+        assert first["final_response"] == "ok"
+        assert second["final_response"] == "ok-2"
+        assert seen_headers[0] == {}
+        assert seen_headers[1]["X-MPP-AUTH"] == "session-token"
+        assert seen_headers[2]["X-MPP-AUTH"] == "session-token"
+
+    def test_run_conversation_refreshes_existing_mpp_session_after_402(self, agent):
+        agent.provider = "paid-provider"
+        agent.api_mode = "chat_completions"
+        agent.payment_adapter = "mpp"
+        agent.payment_config = {
+            "method": "test-method",
+            "credential_headers": {"X-MPP-AUTH": "new-token"},
+        }
+        agent._payment_session_store.set(
+            "paid-provider|https://openrouter.ai/api/v1|anthropic/claude-opus-4.6|test-method",
+            PaymentSessionHandle(
+                adapter="mpp",
+                endpoint_key="paid-provider|https://openrouter.ai/api/v1|anthropic/claude-opus-4.6|test-method",
+                session_id="s1",
+                method="test-method",
+                expires_at=None,
+                state={"headers": {"X-MPP-AUTH": "old-token"}},
+            ),
+        )
+
+        seen_headers = []
+
+        class _PaymentRequiredError(RuntimeError):
+            def __init__(self):
+                super().__init__("payment required")
+                self.status_code = 402
+
+        responses = [_PaymentRequiredError(), _mock_response(content="ok")]
+
+        def _fake_api_call(api_kwargs):
+            seen_headers.append(dict(api_kwargs.get("extra_headers") or {}))
+            nxt = responses.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.time.sleep", return_value=None),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "ok"
+        assert seen_headers[0]["X-MPP-AUTH"] == "old-token"
+        assert seen_headers[1]["X-MPP-AUTH"] == "new-token"
+
+    def test_run_conversation_updates_session_from_receipt(self, agent):
+        agent.provider = "paid-provider"
+        agent.api_mode = "chat_completions"
+        agent.payment_adapter = "mpp"
+        agent.payment_config = {
+            "method": "test-method",
+            "credential_headers": {"X-MPP-AUTH": "session-token"},
+        }
+
+        class _PaymentRequiredError(RuntimeError):
+            def __init__(self):
+                super().__init__("payment required")
+                self.status_code = 402
+                self.response = SimpleNamespace(
+                    status_code=402,
+                    headers={
+                        "X-MPP-Intent": "session",
+                        "X-MPP-Method": "test-method",
+                        "X-MPP-Session-Id": "sess-1",
+                    },
+                    json=lambda: {},
+                )
+
+        responses = [
+            _PaymentRequiredError(),
+            SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None), finish_reason="stop")],
+                model="test/model",
+                usage=None,
+                headers={
+                    "X-MPP-Receipt-Id": "rcpt-1",
+                    "X-MPP-Session-Id": "sess-1",
+                    "X-MPP-Receipt-Verified": "true",
+                },
+                json=lambda: {},
+            ),
+        ]
+
+        def _fake_api_call(api_kwargs):
+            nxt = responses.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.time.sleep", return_value=None),
+        ):
+            result = agent.run_conversation("hello")
+
+        session_key = "paid-provider|https://openrouter.ai/api/v1|anthropic/claude-opus-4.6|test-method"
+        session = agent._payment_session_store.get(session_key)
+
+        assert result["final_response"] == "ok"
+        assert session is not None
+        assert session.session_id == "sess-1"
+        assert session.state["receipt_id"] == "rcpt-1"
 
 
 # ---------------------------------------------------------------------------

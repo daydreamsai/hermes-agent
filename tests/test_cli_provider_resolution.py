@@ -229,6 +229,52 @@ def test_cli_prefers_config_provider_over_stale_env_override(monkeypatch):
     assert shell.requested_provider == "custom"
 
 
+def test_runtime_resolution_passes_payment_runtime_to_agent(monkeypatch):
+    cli = _import_cli()
+
+    def _runtime_resolve(**kwargs):
+        return {
+            "provider": "paid-provider",
+            "api_mode": "chat_completions",
+            "base_url": "https://paid.example/v1",
+            "api_key": "placeholder-key",
+            "source": "env/config",
+            "payment_adapter": "mpp",
+            "payment_config": {"method": "test-method"},
+        }
+
+    class _DummyAgent:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+    monkeypatch.setattr(cli, "AIAgent", _DummyAgent)
+
+    shell = cli.HermesCLI(model="test-model", compact=True, max_turns=1)
+
+    assert shell._init_agent() is True
+    assert shell.agent.kwargs["payment_adapter"] == "mpp"
+    assert shell.agent.kwargs["payment_config"] == {"method": "test-method"}
+
+
+def test_turn_route_preserves_payment_runtime(monkeypatch):
+    cli = _import_cli()
+    shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1)
+    shell.provider = "paid-provider"
+    shell.api_mode = "chat_completions"
+    shell.base_url = "https://paid.example/v1"
+    shell.api_key = "placeholder-key"
+    shell._payment_adapter = "mpp"
+    shell._payment_config = {"method": "test-method"}
+    shell._smart_model_routing = {"enabled": False}
+
+    result = shell._resolve_turn_agent_config("hello")
+
+    assert result["runtime"]["payment_adapter"] == "mpp"
+    assert result["runtime"]["payment_config"] == {"method": "test-method"}
+
+
 def test_codex_provider_replaces_incompatible_default_model(monkeypatch):
     """When provider resolves to openai-codex and no model was explicitly
     chosen, the global config default (e.g. anthropic/claude-opus-4.6) must

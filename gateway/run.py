@@ -254,6 +254,9 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "api_mode": runtime.get("api_mode"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
+        "request_headers_resolver": runtime.get("request_headers_resolver"),
+        "payment_adapter": runtime.get("payment_adapter"),
+        "payment_config": runtime.get("payment_config"),
     }
 
 

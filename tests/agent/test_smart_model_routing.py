@@ -59,3 +59,24 @@ def test_resolve_turn_route_falls_back_to_primary_when_route_runtime_cannot_be_r
     assert result["model"] == "anthropic/claude-sonnet-4"
     assert result["runtime"]["provider"] == "openrouter"
     assert result["label"] is None
+
+
+def test_resolve_turn_route_preserves_payment_runtime_on_primary_path():
+    from agent.smart_model_routing import resolve_turn_route
+
+    result = resolve_turn_route(
+        "what time is it in tokyo?",
+        {**_BASE_CONFIG, "enabled": False},
+        {
+            "model": "anthropic/claude-sonnet-4",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+            "api_key": "sk-primary",
+            "payment_adapter": "mpp",
+            "payment_config": {"method": "test-method"},
+        },
+    )
+
+    assert result["runtime"]["payment_adapter"] == "mpp"
+    assert result["runtime"]["payment_config"] == {"method": "test-method"}

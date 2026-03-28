@@ -205,6 +205,11 @@ def _build_child_agent(
     effective_api_mode = override_api_mode or getattr(parent_agent, "api_mode", None)
     effective_acp_command = getattr(parent_agent, "acp_command", None)
     effective_acp_args = list(getattr(parent_agent, "acp_args", []) or [])
+    effective_request_headers_resolver = creds.get("request_headers_resolver") or getattr(parent_agent, "request_headers_resolver", None)
+    effective_payment_adapter = creds.get("payment_adapter") or getattr(parent_agent, "payment_adapter", None)
+    effective_payment_config = creds.get("payment_config")
+    if effective_payment_config is None:
+        effective_payment_config = getattr(parent_agent, "payment_config", None)
 
     child = AIAgent(
         base_url=effective_base_url,
@@ -214,6 +219,9 @@ def _build_child_agent(
         api_mode=effective_api_mode,
         acp_command=effective_acp_command,
         acp_args=effective_acp_args,
+        request_headers_resolver=effective_request_headers_resolver,
+        payment_adapter=effective_payment_adapter,
+        payment_config=effective_payment_config,
         max_iterations=max_iterations,
         max_tokens=getattr(parent_agent, "max_tokens", None),
         reasoning_config=getattr(parent_agent, "reasoning_config", None),
@@ -611,6 +619,9 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": configured_base_url,
             "api_key": api_key,
             "api_mode": api_mode,
+            "request_headers_resolver": None,
+            "payment_adapter": None,
+            "payment_config": None,
         }
 
     if not configured_provider:
@@ -621,6 +632,9 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": None,
             "api_key": None,
             "api_mode": None,
+            "request_headers_resolver": None,
+            "payment_adapter": None,
+            "payment_config": None,
         }
 
     # Provider is configured — resolve full credentials
@@ -650,6 +664,9 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "api_mode": runtime.get("api_mode"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
+        "request_headers_resolver": runtime.get("request_headers_resolver"),
+        "payment_adapter": runtime.get("payment_adapter"),
+        "payment_config": runtime.get("payment_config"),
     }
 
 
