@@ -205,11 +205,9 @@ def _build_child_agent(
     effective_api_mode = override_api_mode or getattr(parent_agent, "api_mode", None)
     effective_acp_command = getattr(parent_agent, "acp_command", None)
     effective_acp_args = list(getattr(parent_agent, "acp_args", []) or [])
-    effective_request_headers_resolver = creds.get("request_headers_resolver") or getattr(parent_agent, "request_headers_resolver", None)
-    effective_payment_adapter = creds.get("payment_adapter") or getattr(parent_agent, "payment_adapter", None)
-    effective_payment_config = creds.get("payment_config")
-    if effective_payment_config is None:
-        effective_payment_config = getattr(parent_agent, "payment_config", None)
+    effective_request_headers_resolver = getattr(parent_agent, "request_headers_resolver", None)
+    effective_payment_adapter = getattr(parent_agent, "payment_adapter", None)
+    effective_payment_config = getattr(parent_agent, "payment_config", None)
 
     child = AIAgent(
         base_url=effective_base_url,

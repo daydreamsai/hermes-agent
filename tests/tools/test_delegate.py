@@ -550,6 +550,8 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             "base_url": "https://openrouter.ai/api/v1",
             "api_key": "sk-or-test-key",
             "api_mode": "chat_completions",
+            "payment_adapter": "mpp",
+            "payment_config": {"method": "test-method"},
         }
         parent = _make_mock_parent(depth=0)
         cfg = {"model": "google/gemini-3-flash-preview", "provider": "openrouter"}
@@ -559,6 +561,8 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["base_url"], "https://openrouter.ai/api/v1")
         self.assertEqual(creds["api_key"], "sk-or-test-key")
         self.assertEqual(creds["api_mode"], "chat_completions")
+        self.assertEqual(creds["payment_adapter"], "mpp")
+        self.assertEqual(creds["payment_config"], {"method": "test-method"})
         mock_resolve.assert_called_once_with(requested="openrouter")
 
     def test_direct_endpoint_uses_configured_base_url_and_api_key(self):
